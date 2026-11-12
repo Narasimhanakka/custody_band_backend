@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import sys
 import tempfile
@@ -14,7 +15,11 @@ if str(BASE_DIR) not in sys.path:
 from app.gps import gps_routes
 from app.receiver.packet_parser import parse_ud
 from app.services.device_service import DeviceService
-from app.services.firestore_service import FirestoreService, firestore_service
+from app.services.firestore_service import (
+    FirestoreService,
+    firestore_service,
+    normalize_iso_timestamp
+)
 from app.services.gps_service import gps_service
 
 firestore_module = importlib.import_module("app.services.firestore_service")
@@ -53,7 +58,7 @@ class GPSPositionRulesTests(unittest.TestCase):
         valid_time = iso_at(timedelta(seconds=-30))
         self.service.update_position(
             self.device_id, lat=17.44, lon=78.36, battery=78,
-            gps_valid=True, timestamp=valid_time
+            gps_valid=True, timestamp=valid_time, gps_source="watch_tcp"
         )
         self.assertEqual(self.device_state["last_latitude"], 17.44)
         self.assertEqual(self.device_state["last_longitude"], 78.36)
@@ -76,11 +81,12 @@ class GPSPositionRulesTests(unittest.TestCase):
     def test_invalid_coordinates_and_delayed_fix_do_not_replace_newer_fix(self):
         newer_time = iso_at(timedelta(seconds=-10))
         self.service.update_position(
-            self.device_id, lat=18.0, lon=79.0, gps_valid=True, timestamp=newer_time
+            self.device_id, lat=18.0, lon=79.0, gps_valid=True, timestamp=newer_time,
+            gps_source="watch_tcp"
         )
         self.service.update_position(
             self.device_id, lat=25.0, lon=79.0, gps_valid=True,
-            timestamp=iso_at(timedelta(seconds=-20))
+            timestamp=iso_at(timedelta(seconds=-20)), gps_source="watch_tcp"
         )
         self.assertEqual(self.device_state["last_latitude"], 18.0)
         self.assertEqual(self.device_state["last_longitude"], 79.0)
@@ -88,14 +94,14 @@ class GPSPositionRulesTests(unittest.TestCase):
 
         self.service.update_position(
             self.device_id, lat=91.0, lon=79.0, gps_valid=True,
-            timestamp=iso_at()
+            timestamp=iso_at(), gps_source="watch_tcp"
         )
         self.assertEqual(self.device_state["last_latitude"], 18.0)
         self.assertEqual(self.device_state["last_longitude"], 79.0)
 
         self.service.update_position(
             self.device_id, lat=0.0, lon=0.0, gps_valid=True,
-            timestamp=iso_at()
+            timestamp=iso_at(), gps_source="watch_tcp"
         )
         self.assertEqual(self.device_state["last_latitude"], 18.0)
         self.assertEqual(self.device_state["last_longitude"], 79.0)
@@ -108,6 +114,7 @@ class GPSPositionRulesTests(unittest.TestCase):
             "last_longitude": 78.36,
             "last_valid_gps_time": old_time,
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "gps_status": "GPS Locked"
         })
         self.service.update_position(
@@ -136,6 +143,31 @@ class GPSPositionRulesTests(unittest.TestCase):
         self.assertEqual(self.device_state["steps"], 800)
         self.assertFalse(self.device_state["is_charging"])
 
+    def test_position_requires_trusted_source_and_watch_timestamp(self):
+        self.service.update_position(
+            self.device_id,
+            lat=17.44,
+            lon=78.36,
+            gps_valid=True,
+            timestamp=iso_at(),
+            gps_source=None
+        )
+        self.assertFalse(self.device_state["gps_valid"])
+        self.assertNotIn("last_latitude", self.device_state)
+        self.assertNotIn("last_valid_gps_time", self.device_state)
+
+        self.service.update_position(
+            self.device_id,
+            lat=17.44,
+            lon=78.36,
+            gps_valid=True,
+            timestamp=None,
+            gps_source="watch_tcp"
+        )
+        self.assertFalse(self.device_state["gps_valid"])
+        self.assertNotIn("last_latitude", self.device_state)
+        self.assertNotIn("last_valid_gps_time", self.device_state)
+
 
 class SQLiteGPSFallbackTests(unittest.TestCase):
     def setUp(self):
@@ -159,6 +191,7 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             "device_id": "SQLITE_GPS_TEST",
             "timestamp": newer_time,
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "latitude": 18.0,
             "longitude": 79.0,
             "battery": 60
@@ -167,6 +200,7 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             "device_id": "SQLITE_GPS_TEST",
             "timestamp": older_time,
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "latitude": 17.0,
             "longitude": 78.0
         })
@@ -185,6 +219,7 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             "last_longitude": 79.0,
             "last_valid_gps_time": iso_at(timedelta(minutes=-1)),
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "gps_status": "GPS Locked"
         })
         self.service.save_device({
@@ -194,6 +229,7 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             "last_longitude": 78.0,
             "last_valid_gps_time": iso_at(timedelta(minutes=-2)),
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "gps_status": "GPS Locked"
         })
         device = self.service.get_device("SQLITE_DEVICE_TEST")
@@ -207,6 +243,7 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             "device_id": "MERGED_HISTORY_TEST",
             "timestamp": local_time,
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "latitude": 17.0,
             "longitude": 78.0
         })
@@ -238,7 +275,7 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
         self.assertEqual(history[0]["gps_source"], "watch_tcp")
         self.assertEqual((latest["latitude"], latest["longitude"]), (18.0, 79.0))
 
-    def test_firestore_verified_latest_fix_is_exposed_in_history_but_unverified_fix_is_not(self):
+    def test_firestore_snapshot_fix_is_not_backfilled_into_history(self):
         fix_time = iso_at(timedelta(seconds=-10))
         latest_fix = {
             "lat": 18.0,
@@ -261,8 +298,7 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             history = self.service.get_telemetry_history(
                 "FIRESTORE_VERIFIED_HISTORY_TEST", limit=10
             )
-            self.assertEqual(len(history), 1)
-            self.assertEqual(history[0]["gps_source"], "watch_tcp")
+            self.assertEqual(history, [])
 
             device_ref.get.return_value = FakeSnapshot(
                 {"last_fix": {"at": fix_time, "lat": 18.0, "lon": 79.0}},
@@ -279,6 +315,7 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             "device_id": "SQLITE_LOCATION_TEST",
             "timestamp": iso_at(),
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "latitude": 19.0,
             "longitude": 80.0
         })
@@ -287,7 +324,9 @@ class SQLiteGPSFallbackTests(unittest.TestCase):
             {
                 "last_latitude": 17.0,
                 "last_longitude": 78.0,
-                "last_valid_gps_time": iso_at(timedelta(minutes=-1))
+                "last_valid_gps_time": iso_at(timedelta(minutes=-1)),
+                "gps_valid": True,
+                "gps_source": "watch_tcp"
             }
         )
         self.assertEqual((location["latitude"], location["longitude"]), (19.0, 80.0))
@@ -516,7 +555,8 @@ class FirestoreOrderingTests(unittest.TestCase):
         self.assertEqual(document["last_fix"]["gps_source"], "watch_tcp")
         self.assertEqual(document["latest"]["location"]["gps_source"], "watch_tcp")
         history_record = next(
-            data for path, data in self.firestore.history if path[-1] == "history"
+            data for path, data in self.firestore.documents.items()
+            if path[:3] == ("devices", "FIRESTORE_ORDER_TEST", "history")
         )
         self.assertEqual(history_record["gps_source"], "watch_tcp")
         self.assertNotIn("battery", document)
@@ -529,7 +569,8 @@ class FirestoreOrderingTests(unittest.TestCase):
             "timestamp": newer_time,
             "gps_valid": True,
             "latitude": 18.0,
-            "longitude": 79.0
+            "longitude": 79.0,
+            "gps_source": "watch_tcp"
         })
         self.service.save_device({
             "device_id": "FIRESTORE_REVERSE_TEST",
@@ -538,6 +579,7 @@ class FirestoreOrderingTests(unittest.TestCase):
             "last_longitude": 78.0,
             "last_valid_gps_time": older_time,
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "gps_status": "GPS Locked"
         })
 
@@ -590,6 +632,55 @@ class GPSRouteLocationTests(unittest.TestCase):
         self.assertNotIn("battery", latest)
         self.assertIn("steps", latest)
         self.assertIn("heart_rate", latest)
+
+    def test_latest_and_live_routes_hide_stale_coordinates_but_keep_battery(self):
+        stale_time = iso_at(timedelta(minutes=-20))
+        device = {
+            "device_id": "STALE_ROUTE_TEST",
+            "wearer_name": "Test wearer",
+            "battery": 90,
+            "last_valid_gps_time": stale_time,
+            "gps_valid": False,
+            "gps_fix": False,
+            "gps_locked": False,
+            "gps_status": "Location Stale",
+        }
+        stale_location = {
+            "latitude": 17.444978,
+            "longitude": 78.365,
+            "timestamp": stale_time,
+            "gps_source": "watch_tcp",
+            "maps_url": "https://maps.google.com/?q=17.444978,78.365000",
+            "gps_status": "Location Stale",
+            "gps_valid": False,
+            "gps_fix": False,
+            "gps_locked": False,
+        }
+        with (
+            patch.object(gps_routes.device_service, "get_all_devices", return_value=[device]),
+            patch.object(gps_routes.device_service, "get_device_by_id", return_value=device),
+            patch.object(
+                gps_routes.firestore_service,
+                "get_latest_valid_location",
+                return_value=stale_location,
+            ),
+            patch.object(gps_routes.firestore_service, "get_telemetry_history", return_value=[]),
+        ):
+            live = gps_routes.get_live_locations()[0]
+            latest = gps_routes.get_latest_location("STALE_ROUTE_TEST")
+
+        for response in (live, latest):
+            self.assertIsNone(response["latitude"])
+            self.assertIsNone(response["longitude"])
+            self.assertIsNone(response["lat"])
+            self.assertIsNone(response["lon"])
+            self.assertIsNone(response["maps_url"])
+            self.assertIsNone(response["gps_source"])
+            self.assertFalse(response["gps_valid"])
+            self.assertFalse(response["gps_fix"])
+            self.assertFalse(response["gps_locked"])
+            self.assertEqual(response["timestamp"], stale_time)
+            self.assertEqual(response["battery"], 90)
 
 
 class WatchGpsPersistenceTests(unittest.TestCase):
@@ -664,25 +755,34 @@ class WatchGpsPersistenceTests(unittest.TestCase):
                 self._packet(packet_time, "A", 17.445, 78.37, satellites=0),
                 self.device_id,
                 "MNYD",
+                gps_source="watch_tcp",
+            )
+            duplicate = parse_ud(
+                self._packet(packet_time, "A", 17.445, 78.37, satellites=0),
+                self.device_id,
+                "MNYD",
+                gps_source="watch_tcp",
             )
 
         self.assertIsNotNone(record)
+        self.assertIsNotNone(duplicate)
         self.assertTrue(record["gps_valid"])
         self.assertEqual(record["gps_source"], "watch_tcp")
         self.assertEqual(record["timestamp"], expected_time)
         self.assertEqual(record["satellites"], 0)
         remote_history = [
-            data for path, data in fake_firestore.history
-            if path == ("devices", self.device_id, "history")
+            data for path, data in fake_firestore.documents.items()
+            if path[:3] == ("devices", self.device_id, "history")
         ]
         self.assertEqual(len(remote_history), 1)
-        self.assertEqual(remote_history[0]["timestamp"], expected_time)
-        self.assertTrue(remote_history[0]["gps_valid"])
-        self.assertEqual(remote_history[0]["gps_source"], "watch_tcp")
+        history_record = remote_history[0]
+        self.assertEqual(history_record["timestamp"], expected_time)
+        self.assertTrue(history_record["gps_valid"])
+        self.assertEqual(history_record["gps_source"], "watch_tcp")
         remote_device = fake_firestore.documents[("devices", self.device_id)]
         self.assertEqual(remote_device["last_valid_gps_time"], expected_time)
         self.assertEqual(remote_device["gps_source"], "watch_tcp")
-        self.assertEqual(len(queued_threads), 1)
+        self.assertEqual(len(queued_threads), 2)
 
         with patch.object(firestore_module, "is_firebase_active", return_value=False):
             latest = gps_routes.get_latest_location(self.device_id)
@@ -693,8 +793,65 @@ class WatchGpsPersistenceTests(unittest.TestCase):
         self.assertTrue(latest["gps_valid"])
         self.assertEqual(latest["gps_source"], "watch_tcp")
         self.assertEqual(history[0]["timestamp"], expected_time)
+        self.assertEqual(len(history), 1)
         self.assertTrue(history[0]["gps_valid"])
         self.assertEqual(history[0]["gps_source"], "watch_tcp")
+        self.assertEqual((history[0]["latitude"], history[0]["longitude"]), (17.445, 78.37))
+        self.assertEqual((latest["latitude"], latest["longitude"]), (17.445, 78.37))
+
+    def test_invalid_fix_inputs_preserve_location_and_history(self):
+        fix_time = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=2)
+        expected_time = self._gps_time(fix_time)
+        valid = parse_ud(
+            self._packet(fix_time, "A", 17.446317, 78.368395),
+            self.device_id,
+            "MNYD",
+            gps_source="watch_tcp",
+        )
+        self.assertTrue(valid["gps_valid"])
+
+        invalid_packets = [
+            (self._packet(fix_time, "A", 91.0, 78.0), "watch_tcp"),
+            (self._packet(fix_time - timedelta(minutes=16), "A", 18.0, 79.0), "watch_tcp"),
+            (self._packet(fix_time + timedelta(minutes=1), "A", 18.0, 79.0), "watch_tcp"),
+            (self._packet(fix_time + timedelta(seconds=1), "A", 18.0, 79.0), None),
+            (self._packet(fix_time + timedelta(seconds=1), "A", 18.0, 79.0), "untrusted_source"),
+            (
+                b"UD,not-a-date,not-a-time,A,18.000000,N,79.000000,E,"
+                b"0.0,90.0,0.0,0,0,,,00000000",
+                "watch_tcp",
+            ),
+        ]
+        for packet, source in invalid_packets:
+            with self.subTest(source=source, packet=packet[:20]):
+                record = parse_ud(
+                    packet, self.device_id, "MNYD", gps_source=source
+                )
+                self.assertIsNotNone(record)
+                self.assertFalse(record["gps_valid"])
+                self.assertIsNone(record["latitude"])
+                self.assertIsNone(record["longitude"])
+
+        device = firestore_service.get_device(self.device_id)
+        history = firestore_service.get_telemetry_history(self.device_id, limit=10)
+        self.assertEqual(device["last_latitude"], 17.446317)
+        self.assertEqual(device["last_longitude"], 78.368395)
+        self.assertEqual(device["last_valid_gps_time"], expected_time)
+        self.assertEqual(device["gps_source"], "watch_tcp")
+        self.assertEqual(len(history), 1)
+
+    def test_latest_location_rejects_snapshot_without_verified_source(self):
+        fix_time = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        location = firestore_service.get_latest_valid_location(
+            self.device_id,
+            {
+                "last_latitude": 17.44,
+                "last_longitude": 78.36,
+                "last_valid_gps_time": fix_time,
+                "gps_valid": True,
+            }
+        )
+        self.assertIsNone(location)
 
     def test_invalid_v_packet_preserves_previous_valid_location_and_gps_time(self):
         valid_time = datetime.now(timezone.utc).replace(microsecond=0)
@@ -704,6 +861,7 @@ class WatchGpsPersistenceTests(unittest.TestCase):
             self._packet(valid_time, "A", 17.446317, 78.368395),
             self.device_id,
             "MNYD",
+            gps_source="watch_tcp",
         )
         self.assertTrue(valid["gps_valid"])
 
@@ -711,6 +869,7 @@ class WatchGpsPersistenceTests(unittest.TestCase):
             self._packet(invalid_time, "V", 0.0, 0.0),
             self.device_id,
             "MNYD",
+            gps_source="watch_tcp",
         )
 
         self.assertIsNotNone(invalid)
@@ -724,6 +883,9 @@ class WatchGpsPersistenceTests(unittest.TestCase):
         latest_fix = firestore_service.get_latest_valid_telemetry(self.device_id)
         self.assertEqual(latest_fix["timestamp"], expected_time)
         self.assertEqual(latest_fix["gps_source"], "watch_tcp")
+        history = firestore_service.get_telemetry_history(self.device_id, limit=10)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["timestamp"], expected_time)
         latest = gps_routes.get_latest_location(self.device_id)
         self.assertEqual(
             (latest["latitude"], latest["longitude"]), (17.446317, 78.368395)
@@ -741,8 +903,8 @@ class WatchGpsPersistenceTests(unittest.TestCase):
             "last_longitude": 78.36,
             "last_valid_gps_time": expected_time,
             "gps_valid": True,
-            "gps_status": "GPS Locked",
             "gps_source": "watch_tcp",
+            "gps_status": "GPS Locked",
         })
         firestore_service.save_telemetry({
             "device_id": self.device_id,
@@ -760,10 +922,73 @@ class WatchGpsPersistenceTests(unittest.TestCase):
         self.assertTrue(latest["gps_fix"])
         self.assertEqual(latest["timestamp"], expected_time)
         self.assertEqual(latest["gps_source"], "watch_tcp")
+        self.assertEqual((latest["latitude"], latest["longitude"]), (17.44, 78.36))
+        self.assertEqual(len(history), 1)
         self.assertTrue(history[0]["gps_valid"])
         self.assertTrue(history[0]["gps_fix"])
         self.assertEqual(history[0]["timestamp"], expected_time)
         self.assertEqual(history[0]["gps_source"], "watch_tcp")
+        self.assertEqual((history[0]["latitude"], history[0]["longitude"]), (17.44, 78.36))
+
+
+class GPSIngestTimestampTests(unittest.TestCase):
+    class Request:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def json(self):
+            return self.payload
+
+    def test_ingest_requires_packet_gps_timestamp_and_sets_api_source(self):
+        fix_time = iso_at(timedelta(seconds=-2))
+        payload = {
+            "device_id": "GPS_INGEST_TIMESTAMP_TEST",
+            "latitude": 17.44,
+            "longitude": 78.36,
+            "gps_valid": True,
+            "timestamp": fix_time
+        }
+        with (
+            patch.object(
+                gps_routes.gps_service,
+                "process_location_record",
+                side_effect=lambda record: record
+            ) as process_record,
+            patch.object(gps_routes.device_service, "update_position") as update_position
+        ):
+            result = asyncio.run(
+                gps_routes.ingest_gps_telemetry(self.Request(payload))
+            )
+
+        record = result["data"]
+        self.assertTrue(record["gps_valid"])
+        self.assertEqual(record["gps_source"], "gps_ingest_api")
+        self.assertEqual(record["timestamp"], normalize_iso_timestamp(fix_time))
+        saved_record = process_record.call_args.args[0]
+        self.assertEqual(saved_record["timestamp"], record["timestamp"])
+        self.assertEqual(saved_record["gps_source"], "gps_ingest_api")
+        self.assertEqual(update_position.call_args.kwargs["timestamp"], record["timestamp"])
+        self.assertEqual(update_position.call_args.kwargs["gps_source"], "gps_ingest_api")
+
+        missing_time_payload = {**payload, "timestamp": None}
+        with (
+            patch.object(
+                gps_routes.gps_service,
+                "process_location_record",
+                side_effect=lambda record: record
+            ),
+            patch.object(gps_routes.device_service, "update_position") as update_position
+        ):
+            result = asyncio.run(
+                gps_routes.ingest_gps_telemetry(
+                    self.Request(missing_time_payload)
+                )
+            )
+
+        self.assertFalse(result["data"]["gps_valid"])
+        self.assertIsNone(result["data"]["timestamp"])
+        self.assertIsNone(update_position.call_args.kwargs["timestamp"])
+        self.assertFalse(update_position.call_args.kwargs["gps_valid"])
 
 
 if __name__ == "__main__":

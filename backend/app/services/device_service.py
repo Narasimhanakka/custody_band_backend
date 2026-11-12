@@ -9,8 +9,10 @@ from typing import Dict, Any, Optional, List
 from ..utils.datetime_utils import current_iso_timestamp
 from ..utils.logger import app_logger
 from .firestore_service import (
+    GPS_FIX_MAX_AGE_SECONDS,
     firestore_service,
     is_newer_timestamp,
+    normalize_verified_gps_fix,
     normalize_iso_timestamp,
     parse_iso_timestamp,
     valid_coordinate_pair
@@ -61,7 +63,7 @@ class DeviceService:
             try:
                 dt_fix = datetime.fromisoformat(last_gps_time.replace("Z", "+00:00"))
                 now_dt = datetime.now(timezone.utc)
-                if (now_dt - dt_fix).total_seconds() > 900:  # 15 minutes
+                if (now_dt - dt_fix).total_seconds() > GPS_FIX_MAX_AGE_SECONDS:
                     gps_status = "Location Stale"
                     gps_valid = False
             except Exception:
@@ -138,15 +140,22 @@ class DeviceService:
         """
         existing = firestore_service.get_device(device_id) or {}
         received_at = current_iso_timestamp()
-        gps_time = normalize_iso_timestamp(timestamp) if timestamp is not None else received_at
+        gps_time = normalize_iso_timestamp(timestamp)
         last_lat = existing.get("last_latitude")
         last_lon = existing.get("last_longitude")
         last_gps_time = normalize_iso_timestamp(existing.get("last_valid_gps_time"))
-        position = valid_coordinate_pair(lat, lon)
+        verified_fix = normalize_verified_gps_fix(
+            gps_valid,
+            lat,
+            lon,
+            gps_time,
+            gps_source
+        )
+        position = verified_fix[:2] if verified_fix else None
+        if verified_fix is not None:
+            gps_time = verified_fix[2]
         new_valid_fix = (
-            gps_valid
-            and position is not None
-            and gps_time is not None
+            verified_fix is not None
             and is_newer_timestamp(gps_time, last_gps_time)
         )
 
@@ -159,15 +168,31 @@ class DeviceService:
             last_fix = parse_iso_timestamp(last_gps_time)
             is_stale = (
                 last_fix is not None
-                and (datetime.now(timezone.utc) - last_fix).total_seconds() > 900
+                and (datetime.now(timezone.utc) - last_fix).total_seconds() > GPS_FIX_MAX_AGE_SECONDS
+            )
+            incoming_fix_time = parse_iso_timestamp(gps_time)
+            incoming_is_stale = (
+                incoming_fix_time is not None
+                and (datetime.now(timezone.utc) - incoming_fix_time).total_seconds() > GPS_FIX_MAX_AGE_SECONDS
             )
             previous_fix_is_newer = (
                 last_fix is not None
                 and parse_iso_timestamp(gps_time) is not None
                 and parse_iso_timestamp(gps_time) < last_fix
             )
+            duplicate_fix = (
+                verified_fix is not None
+                and parse_iso_timestamp(gps_time) == last_fix
+                and position == valid_coordinate_pair(last_lat, last_lon)
+            )
 
-            if previous_fix_is_newer:
+            if duplicate_fix:
+                is_fix = bool(existing.get("gps_valid")) and not is_stale
+                gps_status = (
+                    "Location Stale" if is_stale
+                    else (existing.get("gps_status") or ("GPS Locked" if is_fix else "No Fix"))
+                )
+            elif previous_fix_is_newer:
                 # Delayed packets must not change the state of a newer accepted fix.
                 prior_status = existing.get("gps_status")
                 is_fix = bool(existing.get("gps_valid")) and not is_stale
@@ -177,7 +202,9 @@ class DeviceService:
                 )
             else:
                 is_fix = False
-                gps_status = "Location Stale" if is_stale else "No Fix"
+                gps_status = (
+                    "Location Stale" if is_stale or incoming_is_stale else "No Fix"
+                )
 
         # Resolve battery: actual reading if given, else preserve existing; NEVER default to 90
         dev_battery = battery if battery is not None else existing.get("battery")
@@ -219,8 +246,8 @@ class DeviceService:
             update_data["maps_url"] = f"https://maps.google.com/?q={last_lat:.6f},{last_lon:.6f}"
         if last_gps_time:
             update_data["last_valid_gps_time"] = last_gps_time
-        if new_valid_fix and gps_source:
-            update_data["gps_source"] = gps_source
+        if new_valid_fix and verified_fix is not None:
+            update_data["gps_source"] = verified_fix[3]
 
         if dev_battery is not None:
             update_data["battery"] = dev_battery

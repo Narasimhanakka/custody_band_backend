@@ -4,6 +4,7 @@ Provides abstraction for Firestore with transparent SQLite fallback when offline
 Uses real device telemetry without mock defaults.
 """
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -19,6 +20,8 @@ from ..utils.datetime_utils import current_iso_timestamp
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 LOCAL_DB = BASE_DIR / "custody_watch.db"
+TRUSTED_GPS_SOURCES = frozenset({"watch_tcp", "gps_ingest_api"})
+GPS_FIX_MAX_AGE_SECONDS = 900
 
 
 def parse_iso_timestamp(value: Any) -> Optional[datetime]:
@@ -67,6 +70,40 @@ def valid_coordinate_pair(latitude: Any, longitude: Any) -> Optional[Tuple[float
     ):
         return None
     return lat, lon
+
+
+def is_gps_valid_flag(value: Any) -> bool:
+    return value is True or (type(value) is int and value == 1)
+
+
+def normalize_verified_gps_fix(
+    gps_valid: Any,
+    latitude: Any,
+    longitude: Any,
+    timestamp: Any,
+    gps_source: Any,
+    *,
+    max_age_seconds: Optional[int] = GPS_FIX_MAX_AGE_SECONDS
+) -> Optional[Tuple[float, float, str, str]]:
+    source = str(gps_source or "").strip().lower()
+    position = valid_coordinate_pair(latitude, longitude)
+    normalized_time = normalize_iso_timestamp(timestamp)
+    fix_time = parse_iso_timestamp(normalized_time)
+    if (
+        not is_gps_valid_flag(gps_valid)
+        or source not in TRUSTED_GPS_SOURCES
+        or position is None
+        or fix_time is None
+    ):
+        return None
+
+    age_seconds = (datetime.now(timezone.utc) - fix_time).total_seconds()
+    if age_seconds < 0 or (
+        max_age_seconds is not None and age_seconds > max_age_seconds
+    ):
+        return None
+
+    return round(position[0], 6), round(position[1], 6), normalized_time, source
 
 
 class FirestoreService:
@@ -388,11 +425,20 @@ class FirestoreService:
         incoming_lon = device_data.get("last_longitude")
         if incoming_lon is None:
             incoming_lon = device_data.get("longitude", device_data.get("lon", device_data.get("lng")))
-        incoming_fix_time = normalize_iso_timestamp(device_data.get("last_valid_gps_time"))
-        incoming_position = valid_coordinate_pair(incoming_lat, incoming_lon)
-        incoming_fix_is_valid = bool(device_data.get("gps_valid")) and incoming_position is not None and incoming_fix_time is not None
+        verified_fix = normalize_verified_gps_fix(
+            device_data.get("gps_valid"),
+            incoming_lat,
+            incoming_lon,
+            device_data.get("last_valid_gps_time"),
+            device_data.get("gps_source")
+        )
+        incoming_position = verified_fix[:2] if verified_fix else None
+        incoming_fix_time = verified_fix[2] if verified_fix else None
+        incoming_fix_is_valid = verified_fix is not None
         gps_state_supplied = "gps_valid" in device_data or "gps_status" in device_data
         received_at = normalize_iso_timestamp(device_data.get("last_seen")) or current_iso_timestamp()
+        gps_valid_value = is_gps_valid_flag(device_data.get("gps_valid", False))
+        gps_status_value = device_data.get("gps_status", "No Fix")
 
         # 1. Local SQLite Backup
         try:
@@ -414,7 +460,7 @@ class FirestoreService:
                 and is_newer_timestamp(incoming_fix_time, last_valid_gps_time)
             )
             gps_source_value = (
-                device_data.get("gps_source") if accepted_fix else previous.get("gps_source")
+                verified_fix[3] if accepted_fix and verified_fix else previous.get("gps_source")
             )
             if accepted_fix and incoming_position is not None:
                 last_lat, last_lon = incoming_position
@@ -424,12 +470,17 @@ class FirestoreService:
             state_is_newer = gps_state_supplied and is_newer_timestamp(
                 received_at, previous.get("last_seen"), allow_equal=True
             )
-            gps_valid_value = (
-                1 if device_data.get("gps_valid") else 0
-            ) if state_is_newer else previous.get("gps_valid", 0)
-            gps_status_value = (
-                device_data.get("gps_status", "No Fix")
-            ) if state_is_newer else previous.get("gps_status", "No Fix")
+            if state_is_newer:
+                incoming_gps_valid = is_gps_valid_flag(device_data.get("gps_valid", False))
+                if not incoming_gps_valid or accepted_fix:
+                    gps_valid_value = 1 if incoming_gps_valid and accepted_fix else 0
+                    gps_status_value = device_data.get("gps_status", "No Fix")
+                else:
+                    gps_valid_value = previous.get("gps_valid", 0)
+                    gps_status_value = previous.get("gps_status", "No Fix")
+            else:
+                gps_valid_value = previous.get("gps_valid", 0)
+                gps_status_value = previous.get("gps_status", "No Fix")
             last_seen_value = (
                 received_at
                 if is_newer_timestamp(received_at, previous.get("last_seen"), allow_equal=True)
@@ -560,12 +611,12 @@ class FirestoreService:
                             spd = 0.0
 
                         if gps_state_supplied:
-                            is_valid_fix = bool(device_data.get("gps_valid", False))
+                            is_valid_fix = bool(gps_valid_value)
                             sync_doc.update({
                                 "gps_valid": is_valid_fix,
                                 "gps_fix": is_valid_fix,
                                 "gps_locked": is_valid_fix,
-                                "gps_status": device_data.get("gps_status", "No Fix")
+                                "gps_status": gps_status_value
                             })
 
                         if batt_val is not None:
@@ -587,7 +638,7 @@ class FirestoreService:
                                 "last_valid_gps_time": incoming_fix_time,
                                 "maps_url": f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
                             })
-                            gps_source = device_data.get("gps_source")
+                            gps_source = verified_fix[3] if verified_fix else None
                             if gps_source:
                                 sync_doc["gps_source"] = gps_source
                                 sync_doc["last_fix"] = {
@@ -797,10 +848,17 @@ class FirestoreService:
         Never overwrites valid device coordinates with invalid readings.
         """
         dev_id = str(data["device_id"])
-        gps_time = normalize_iso_timestamp(data.get("timestamp"))
-        position = valid_coordinate_pair(data.get("latitude"), data.get("longitude"))
-        is_gps_valid = bool(data.get("gps_valid", False)) and position is not None and gps_time is not None
-        lat, lon = position if is_gps_valid and position is not None else (None, None)
+        verified_fix = normalize_verified_gps_fix(
+            data.get("gps_valid"),
+            data.get("latitude"),
+            data.get("longitude"),
+            data.get("timestamp"),
+            data.get("gps_source")
+        )
+        if verified_fix is None:
+            return
+        lat, lon, gps_time, gps_source = verified_fix
+        is_gps_valid = True
         speed_val = data.get("speed_kmh") if data.get("speed_kmh") is not None else data.get("speed")
         bearing_val = (
             data.get("heading")
@@ -809,32 +867,49 @@ class FirestoreService:
         )
         batt_val = data.get("battery")
         steps_val = data.get("steps")
-        gps_source = data.get("gps_source")
         received_at = current_iso_timestamp()
+        history_document_id = hashlib.sha256(
+            f"{dev_id}|{gps_time}|{lat:.6f}|{lon:.6f}|{gps_source}".encode("utf-8")
+        ).hexdigest()
+        maps_url = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+        telemetry_record_data = {
+            **data,
+            "timestamp": gps_time,
+            "gps_valid": True,
+            "gps_fix": True,
+            "gps_locked": True,
+            "gps_status": "GPS Locked",
+            "gps_source": gps_source,
+            "latitude": lat,
+            "longitude": lon,
+            "maps_url": maps_url,
+        }
 
         # 1. Local SQLite
         try:
             conn = sqlite3.connect(str(LOCAL_DB))
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO telemetry (
+                INSERT OR IGNORE INTO telemetry (
                     device_id, timestamp, gps_valid, latitude, longitude,
-                    speed_kmh, battery, steps, maps_url, heading, bearing, course, gps_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    speed_kmh, battery, steps, maps_url, heading, bearing, course,
+                    gps_source, firestore_document_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 dev_id,
-                data.get("timestamp"),
+                gps_time,
                 1 if is_gps_valid else 0,
                 lat,
                 lon,
                 float(speed_val) if speed_val is not None else 0.0,
                 batt_val,
                 steps_val,
-                data.get("maps_url"),
+                maps_url,
                 float(bearing_val) if bearing_val is not None else 0.0,
                 float(bearing_val) if bearing_val is not None else 0.0,
                 float(bearing_val) if bearing_val is not None else 0.0,
-                gps_source
+                gps_source,
+                history_document_id
             ))
             conn.commit()
             conn.close()
@@ -849,10 +924,10 @@ class FirestoreService:
                     if db:
                         h = float(bearing_val or 0.0)
                         spd = float(speed_val or 0.0)
-                        ts = data.get("timestamp") or received_at
+                        ts = gps_time
 
                         telemetry_record = {
-                            **data,
+                            **telemetry_record_data,
                             "heading": h,
                             "bearing": h,
                             "course": h,
@@ -865,17 +940,19 @@ class FirestoreService:
                             "gps_valid": is_gps_valid,
                             "gps_fix": is_gps_valid,
                             "gps_locked": is_gps_valid,
-                            "gps_status": data.get(
-                                "gps_status", "GPS Locked" if is_gps_valid else "No Fix"
-                            ),
+                            "gps_status": "GPS Locked",
                         }
                         if batt_val is not None:
                             telemetry_record["battery"] = batt_val
                             telemetry_record["battery_percent"] = batt_val
 
-                        # Add to telemetry collection and device history subcollection
-                        db.collection("telemetry").add(telemetry_record)
-                        db.collection("devices").document(dev_id).collection("history").add(telemetry_record)
+                        # Deterministic IDs make a retransmitted fix idempotent.
+                        db.collection("telemetry").document(history_document_id).set(
+                            telemetry_record, merge=True
+                        )
+                        db.collection("devices").document(dev_id).collection(
+                            "history"
+                        ).document(history_document_id).set(telemetry_record, merge=True)
 
                         # Update parent device document
                         gps_status_str = telemetry_record["gps_status"]
@@ -983,21 +1060,18 @@ class FirestoreService:
             return None
 
         gps_source = fix.get("gps_source") or fix.get("source")
-        is_valid = any(
-            fix.get(flag) is True
-            for flag in ("gps_valid", "gps_fix", "gps_locked")
-        )
-        position = valid_coordinate_pair(
+        verified_fix = normalize_verified_gps_fix(
+            any(is_gps_valid_flag(fix.get(flag)) for flag in ("gps_valid", "gps_fix", "gps_locked")),
             fix.get("latitude", fix.get("lat")),
-            fix.get("longitude", fix.get("lon", fix.get("lng")))
+            fix.get("longitude", fix.get("lon", fix.get("lng"))),
+            fix.get("timestamp") or fix.get("at") or fix.get("gps_time"),
+            gps_source,
+            max_age_seconds=None
         )
-        timestamp = normalize_iso_timestamp(
-            fix.get("timestamp") or fix.get("at") or fix.get("gps_time")
-        )
-        if not gps_source or not is_valid or position is None or timestamp is None:
+        if verified_fix is None:
             return None
 
-        latitude, longitude = position
+        latitude, longitude, timestamp, gps_source = verified_fix
         return {
             "device_id": device_id,
             "timestamp": timestamp,
@@ -1064,68 +1138,30 @@ class FirestoreService:
                 records = []
                 for snapshot in snapshots:
                     record = snapshot.to_dict() or {}
-                    raw_timestamp = record.get("timestamp")
-                    timestamp = normalize_iso_timestamp(raw_timestamp)
-                    position = valid_coordinate_pair(
-                        record.get("latitude", record.get("lat")),
-                        record.get("longitude", record.get("lon", record.get("lng")))
-                    )
-                    is_valid = (
-                        bool(record.get("gps_valid", record.get("gps_fix", False)))
-                        and position is not None
-                        and timestamp is not None
-                    )
-                    latitude, longitude = position if is_valid and position else (None, None)
+                    verified_fix = self._normalize_verified_fix(device_id, record)
+                    if verified_fix is None:
+                        continue
+                    timestamp = verified_fix["timestamp"]
+                    latitude = verified_fix["latitude"]
+                    longitude = verified_fix["longitude"]
                     records.append((
                         record.get("device_id") or device_id,
                         timestamp,
-                        1 if is_valid else 0,
+                        1,
                         latitude,
                         longitude,
                         float(record.get("speed_kmh") or record.get("speed") or 0.0),
                         record.get("battery"),
                         record.get("steps"),
-                        record.get("maps_url"),
+                        verified_fix["maps_url"],
                         float(record.get("heading") or record.get("bearing") or 0.0),
                         float(record.get("bearing") or record.get("heading") or 0.0),
                         float(record.get("course") or record.get("heading") or 0.0),
                         int(bool(record.get("is_charging") or record.get("charging"))),
                         int(bool(record.get("charging") or record.get("is_charging"))),
-                        record.get("gps_source") or record.get("source"),
+                        verified_fix["gps_source"],
                         snapshot.id
                     ))
-
-                device_snapshot = db.collection("devices").document(device_id).get(timeout=2.0)
-                device_data = {}
-                if device_snapshot.exists:
-                    device_data = device_snapshot.to_dict() or {}
-                latest = device_data.get("latest")
-                latest_location = latest.get("location") if isinstance(latest, dict) else None
-                for snapshot_name, candidate in (
-                    ("last_fix", device_data.get("last_fix")),
-                    ("latest", latest_location)
-                ):
-                    verified_fix = self._normalize_verified_fix(device_id, candidate)
-                    if verified_fix is not None:
-                        position = (verified_fix["latitude"], verified_fix["longitude"])
-                        records.append((
-                            device_id,
-                            verified_fix["timestamp"],
-                            1,
-                            position[0],
-                            position[1],
-                            float(candidate.get("speed_kmh") or candidate.get("speed") or 0.0),
-                            candidate.get("battery"),
-                            candidate.get("steps"),
-                            verified_fix["maps_url"],
-                            float(candidate.get("heading") or candidate.get("bearing") or 0.0),
-                            float(candidate.get("bearing") or candidate.get("heading") or 0.0),
-                            float(candidate.get("course") or candidate.get("heading") or 0.0),
-                            int(bool(candidate.get("is_charging") or candidate.get("charging"))),
-                            int(bool(candidate.get("charging") or candidate.get("is_charging"))),
-                            verified_fix["gps_source"],
-                            f"snapshot:{snapshot_name}:{verified_fix['timestamp']}"
-                        ))
 
                 conn = sqlite3.connect(str(LOCAL_DB))
                 try:
@@ -1196,10 +1232,12 @@ class FirestoreService:
                 SELECT * FROM telemetry
                 WHERE device_id = ?
                   AND gps_valid = 1
+                  AND gps_source IN ('watch_tcp', 'gps_ingest_api')
                   AND latitude BETWEEN -90 AND 90
                   AND longitude BETWEEN -180 AND 180
                   AND NOT (latitude = 0 AND longitude = 0)
                   AND julianday(timestamp) IS NOT NULL
+                  AND julianday(timestamp) <= julianday('now')
                 ORDER BY julianday(timestamp) DESC, id DESC
                 LIMIT 1
                 """,
@@ -1222,16 +1260,19 @@ class FirestoreService:
         device_lon = device_data.get("last_longitude")
         if device_lon is None:
             device_lon = device_data.get("longitude")
-        device_coords = valid_coordinate_pair(device_lat, device_lon)
         device_time = device_data.get("last_valid_gps_time")
         location: Optional[Dict[str, Any]] = None
-        if device_coords is not None:
+        device_fix = self._normalize_verified_fix(device_id, {
+            "gps_valid": device_data.get("gps_valid"),
+            "latitude": device_lat,
+            "longitude": device_lon,
+            "timestamp": device_time,
+            "gps_source": device_data.get("gps_source")
+        })
+        if device_fix is not None:
             location = {
-                "latitude": device_coords[0],
-                "longitude": device_coords[1],
-                "timestamp": device_time,
+                **device_fix,
                 "maps_url": device_data.get("maps_url"),
-                "gps_source": device_data.get("gps_source"),
                 "is_newer": False
             }
 
@@ -1280,7 +1321,8 @@ class FirestoreService:
             fix_time = parse_iso_timestamp(location.get("timestamp"))
             is_stale = (
                 fix_time is not None
-                and (datetime.now(timezone.utc) - fix_time).total_seconds() > 900
+                and (datetime.now(timezone.utc) - fix_time).total_seconds()
+                > GPS_FIX_MAX_AGE_SECONDS
             )
             location["gps_status"] = "Location Stale" if is_stale else "GPS Locked"
             location["gps_valid"] = not is_stale
@@ -1297,6 +1339,13 @@ class FirestoreService:
                 """
                 SELECT * FROM telemetry
                 WHERE device_id = ?
+                  AND gps_valid = 1
+                  AND gps_source IN ('watch_tcp', 'gps_ingest_api')
+                  AND latitude BETWEEN -90 AND 90
+                  AND longitude BETWEEN -180 AND 180
+                  AND NOT (latitude = 0 AND longitude = 0)
+                  AND julianday(timestamp) IS NOT NULL
+                  AND julianday(timestamp) <= julianday('now')
                 ORDER BY julianday(timestamp) DESC, id DESC
                 LIMIT ?
                 """,
@@ -1316,7 +1365,7 @@ class FirestoreService:
             )
             key = (
                 timestamp,
-                bool(record.get("gps_valid", record.get("gps_fix", False))),
+                record.get("gps_source"),
                 position
             )
             if key in seen:

@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, Tuple
 from ..utils.logger import tcp_logger, gps_logger
 from ..services.gps_service import gps_service
 from ..services.device_service import device_service
+from ..services.firestore_service import normalize_verified_gps_fix, valid_coordinate_pair
 from ..services.alert_service import alert_service
 
 REPLIES = {
@@ -48,7 +49,12 @@ def _parse_watch_gps_timestamp(date_value: str, time_value: str) -> Optional[str
     return timestamp.isoformat()
 
 
-def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, Any]]:
+def parse_ud(
+    content: bytes,
+    device_id: str,
+    maker: str,
+    gps_source: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
     Parses Huaten UD / CRUD / AL packets:
     fields[0] : Command (UD / CRUD / AL)
@@ -101,9 +107,17 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
         if len(fields) > 7 and fields[7].strip().upper() == "W":
             lon = -abs(lon)
 
-        # Coordinate boundary checks (-90 <= lat <= 90, -180 <= lon <= 180, not 0,0)
-        is_valid_coords = (-90.0 <= lat <= 90.0) and (-180.0 <= lon <= 180.0) and not (lat == 0.0 and lon == 0.0)
-        is_valid_gps = (status == "A") and is_valid_coords and gps_timestamp is not None
+        is_valid_coords = valid_coordinate_pair(lat, lon) is not None
+        verified_fix = normalize_verified_gps_fix(
+            status == "A",
+            lat,
+            lon,
+            gps_timestamp,
+            gps_source
+        )
+        is_valid_gps = verified_fix is not None
+        if verified_fix is not None:
+            lat, lon, gps_timestamp, gps_source = verified_fix
         _log_gps_diagnostic(
             "GPS packet device=%s command=%s status=%s coordinates_valid=%s timestamp_valid=%s",
             device_id,
@@ -153,7 +167,7 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
             "gps_fix": is_valid_gps,
             "gps_locked": is_valid_gps,
             "gps_status": gps_status,
-            "gps_source": "watch_tcp" if is_valid_gps else None,
+            "gps_source": gps_source if is_valid_gps else None,
             "latitude": round(lat, 6) if is_valid_gps else None,
             "longitude": round(lon, 6) if is_valid_gps else None,
             "speed_kmh": speed,
@@ -188,17 +202,17 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
         gps_processing_succeeded = processed_record is record
         device_service.update_position(
             device_id=device_id,
-            lat=round(lat, 6) if is_valid_gps else None,
-            lon=round(lon, 6) if is_valid_gps else None,
+            lat=record.get("latitude"),
+            lon=record.get("longitude"),
             battery=battery,
             steps=steps,
             speed=speed,
             bearing=course,
             is_charging=is_charging,
-            gps_valid=is_valid_gps,
+            gps_valid=bool(record.get("gps_valid")),
             satellites=satellites,
             gsm_signal=gsm_signal,
-            timestamp=gps_timestamp,
+            timestamp=record.get("timestamp"),
             gps_source=record.get("gps_source")
         )
         device_position_update_succeeded = True
@@ -238,7 +252,12 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
         return None
 
 
-def parse_packet(maker: str, dev_id: str, content: bytes) -> Tuple[Optional[str], Optional[bytes]]:
+def parse_packet(
+    maker: str,
+    dev_id: str,
+    content: bytes,
+    gps_source: Optional[str] = None
+) -> Tuple[Optional[str], Optional[bytes]]:
     """
     Decodes packet content, dispatches business logic, and returns (cmd_type, reply_frame_bytes).
     """
@@ -255,7 +274,7 @@ def parse_packet(maker: str, dev_id: str, content: bytes) -> Tuple[Optional[str]
 
     # 1. Location / Telemetry
     if cmd in ("UD", "CRUD", "AL"):
-        parse_ud(content, dev_id, maker)
+        parse_ud(content, dev_id, maker, gps_source=gps_source)
 
     # 2. Keepalive (KA)
     elif cmd == "KA":

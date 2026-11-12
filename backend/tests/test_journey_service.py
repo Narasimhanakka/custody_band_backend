@@ -10,7 +10,7 @@ Verifies:
 """
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 from app.services.journey_service import journey_service, format_duration
 from app.services.gps_service import gps_service
@@ -59,6 +59,7 @@ class TestJourneyTracking(unittest.TestCase):
             "last_latitude": 17.446317,
             "last_longitude": 78.368395,
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "status": "ONLINE",
             "last_seen": self.valid_gps_timestamp,
             "last_valid_gps_time": self.valid_gps_timestamp
@@ -81,6 +82,38 @@ class TestJourneyTracking(unittest.TestCase):
         self.assertAlmostEqual(journey["start_location"]["longitude"], 78.368395, places=4)
         self.assertEqual(journey["total_distance_km"], 0.0)
         self.assertEqual(len(journey["route_coordinates"]), 1)
+
+    def test_start_journey_ignores_untrusted_or_stale_device_fix(self):
+        stale_timestamp = (
+            datetime.now(timezone.utc) - timedelta(minutes=16)
+        ).isoformat()
+        snapshots = [
+            {
+                "gps_valid": True,
+                "last_latitude": 17.446317,
+                "last_longitude": 78.368395,
+                "last_valid_gps_time": self.valid_gps_timestamp,
+            },
+            {
+                "gps_valid": True,
+                "gps_source": "watch_tcp",
+                "last_latitude": 17.446317,
+                "last_longitude": 78.368395,
+                "last_valid_gps_time": stale_timestamp,
+            },
+        ]
+
+        for snapshot in snapshots:
+            with self.subTest(snapshot=snapshot):
+                journey_service._active_journeys.clear()
+                with patch.object(
+                    firestore_service, "get_device", return_value=snapshot
+                ):
+                    journey = journey_service.start_journey(self.device_id)
+                    self.assertIsNone(journey["start_location"])
+                    journey_service.end_journey(self.device_id)
+
+        journey_service._active_journeys.clear()
 
     def test_2_live_route_tracking_accumulates_distance_haversine(self):
         """LIVE ROUTE TRACKING calculates travelled distance using Haversine formula."""
@@ -179,6 +212,7 @@ class TestJourneyTracking(unittest.TestCase):
             "last_latitude": 17.450000,
             "last_longitude": 78.380000,
             "gps_valid": True,
+            "gps_source": "watch_tcp",
             "last_valid_gps_time": datetime.now(timezone.utc).isoformat()
         })
         j2 = journey_service.start_journey(self.device_id)

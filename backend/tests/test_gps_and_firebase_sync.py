@@ -135,7 +135,7 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         content = self._watch_packet(
             datetime.now(timezone.utc), "A", 17.445, 78.37, battery=73, satellites=0
         )
-        rec = parse_ud(content, self.dev_id, self.maker)
+        rec = parse_ud(content, self.dev_id, self.maker, gps_source="watch_tcp")
 
         self.assertIsNotNone(rec)
         self.assertTrue(rec["gps_valid"])
@@ -154,7 +154,7 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         content = self._watch_packet(
             datetime.now(timezone.utc), "V", 0.0, 0.0, battery=65, satellites=0
         )
-        rec = parse_ud(content, self.dev_id, self.maker)
+        rec = parse_ud(content, self.dev_id, self.maker, gps_source="watch_tcp")
 
         self.assertIsNotNone(rec)
         self.assertFalse(rec["gps_valid"])
@@ -173,7 +173,7 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         valid_content = self._watch_packet(
             valid_time, "A", 17.446317, 78.368395, battery=88, satellites=0
         )
-        parse_ud(valid_content, self.dev_id, self.maker)
+        parse_ud(valid_content, self.dev_id, self.maker, gps_source="watch_tcp")
 
         dev_after_valid = device_service.get_device_by_id(self.dev_id)
         self.assertEqual(dev_after_valid["last_latitude"], 17.446317)
@@ -184,7 +184,7 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         invalid_content = self._watch_packet(
             valid_time + timedelta(seconds=1), "V", 0.0, 0.0, battery=85, satellites=0
         )
-        parse_ud(invalid_content, self.dev_id, self.maker)
+        parse_ud(invalid_content, self.dev_id, self.maker, gps_source="watch_tcp")
 
         dev_after_invalid = device_service.get_device_by_id(self.dev_id)
         # Previous coordinates MUST be preserved on device
@@ -199,7 +199,7 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         invalid_content = self._watch_packet(
             datetime.now(timezone.utc), "V", 0.0, 0.0, battery=42, satellites=0
         )
-        parse_ud(invalid_content, self.dev_id, self.maker)
+        parse_ud(invalid_content, self.dev_id, self.maker, gps_source="watch_tcp")
 
         dev = device_service.get_device_by_id(self.dev_id)
         self.assertEqual(dev["battery"], 42)
@@ -217,12 +217,12 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
                 battery=test_batt,
                 satellites=0,
             )
-            parse_ud(content, self.dev_id, self.maker)
+            parse_ud(content, self.dev_id, self.maker, gps_source="watch_tcp")
             dev = device_service.get_device_by_id(self.dev_id)
             self.assertEqual(dev["battery"], test_batt, f"Battery should be {test_batt}, not defaulted to 90")
 
-    def test_06_gps_status_transitions_between_locked_no_fix_and_stale(self):
-        """Test 6: Transitions correctly between GPS Locked, No Fix, and Location Stale (> 15 min old)."""
+    def test_06_gps_status_transitions_and_rejects_stale_incoming_fix(self):
+        """A stale incoming GPS timestamp must not be stored as a location."""
         # 1. Fresh valid fix -> GPS Locked
         now_ts = datetime.now(timezone.utc).isoformat()
         device_service.update_position(
@@ -232,7 +232,8 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
             battery=80,
             steps=1000,
             gps_valid=True,
-            timestamp=now_ts
+            timestamp=now_ts,
+            gps_source="watch_tcp"
         )
         dev = device_service.get_device_by_id(self.dev_id)
         self.assertEqual(dev["gps_status"], "GPS Locked")
@@ -263,17 +264,21 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
             battery=78,
             steps=1020,
             gps_valid=True,
-            timestamp=old_time
+            timestamp=old_time,
+            gps_source="watch_tcp"
         )
         dev = device_service.get_device_by_id(stale_device_id)
-        self.assertEqual(dev["gps_status"], "Location Stale")
+        self.assertEqual(dev["gps_status"], "No Fix")
+        self.assertFalse(dev["gps_valid"])
+        self.assertIsNone(dev["last_latitude"])
+        self.assertIsNone(dev["last_valid_gps_time"])
 
     def test_07_frontend_map_displays_actual_valid_device_coordinates(self):
         """Test 7: Dashboard markers and devices list display real coordinates without mock fallbacks."""
         content = self._watch_packet(
             datetime.now(timezone.utc), "A", 17.448123, 78.371456, battery=68, satellites=0
         )
-        parse_ud(content, self.dev_id, self.maker)
+        parse_ud(content, self.dev_id, self.maker, gps_source="watch_tcp")
 
         summary = dashboard_service.get_summary_stats()
         self.assertGreaterEqual(summary["total_devices"], 1)
@@ -303,6 +308,27 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         dev = device_service.get_device_by_id(self.dev_id)
         self.assertEqual(dev["battery"], 49)
         self.assertEqual(dev["steps"], 3100)
+
+    def test_heartbeat_does_not_change_gps_fix_or_append_history(self):
+        fix_time = datetime.now(timezone.utc).replace(microsecond=0)
+        parse_ud(
+            self._watch_packet(fix_time, "A", 17.445, 78.37),
+            self.dev_id,
+            self.maker,
+            gps_source="watch_tcp"
+        )
+        before = device_service.get_device_by_id(self.dev_id)
+        history_before = firestore_service.get_telemetry_history(self.dev_id, limit=10)
+
+        parse_packet(self.maker, self.dev_id, b"KA,2800,0,54,0")
+
+        after = device_service.get_device_by_id(self.dev_id)
+        history_after = firestore_service.get_telemetry_history(self.dev_id, limit=10)
+        self.assertEqual(after["last_latitude"], before["last_latitude"])
+        self.assertEqual(after["last_longitude"], before["last_longitude"])
+        self.assertEqual(after["last_valid_gps_time"], before["last_valid_gps_time"])
+        self.assertEqual(after["gps_source"], before["gps_source"])
+        self.assertEqual(len(history_after), len(history_before))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from backend.app.custody.custody_routes import _format_custody_record
@@ -61,6 +62,8 @@ class CustodyLocationTests(unittest.TestCase):
             "last_longitude": 78.1,
             "gps_valid": True,
             "gps_status": "GPS Locked",
+            "last_valid_gps_time": datetime.now(timezone.utc).isoformat(),
+            "gps_source": "watch_tcp",
         }
         get_devices.return_value = [device]
 
@@ -79,6 +82,8 @@ class CustodyLocationTests(unittest.TestCase):
             "last_latitude": 0.0,
             "last_longitude": 12.5,
             "gps_valid": True,
+            "last_valid_gps_time": datetime.now(timezone.utc).isoformat(),
+            "gps_source": "watch_tcp",
         }]
 
         location = get_live_locations()[0]

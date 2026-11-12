@@ -84,7 +84,9 @@ def handle_tcp_client(conn: socket.socket, addr):
                 register_client(dev_id, conn)
 
                 try:
-                    cmd_type, reply_bytes = parse_packet(maker, dev_id, content)
+                    cmd_type, reply_bytes = parse_packet(
+                        maker, dev_id, content, gps_source="watch_tcp"
+                    )
                 except Exception as exc:
                     tcp_logger.error(
                         "TCP packet parsing failed for device %s exception_type=%s stack=%s",
@@ -174,7 +176,9 @@ def run_udp_server():
                 _log_diagnostic("UDP extracted %d complete frame(s)", len(frames))
                 for maker, dev_id, content in frames:
                     try:
-                        cmd_type, reply_bytes = parse_packet(maker, dev_id, content)
+                        cmd_type, reply_bytes = parse_packet(
+                            maker, dev_id, content, gps_source="watch_udp"
+                        )
                     except Exception as exc:
                         tcp_logger.error(
                             "UDP packet parsing failed for device %s exception_type=%s stack=%s",

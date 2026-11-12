@@ -7,10 +7,13 @@ from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException, status, Query, Request
 from pydantic import BaseModel, Field
 from ..services.gps_service import gps_service
-from ..services.firestore_service import firestore_service
+from ..services.firestore_service import (
+    firestore_service,
+    is_gps_valid_flag,
+    normalize_verified_gps_fix
+)
 from ..services.device_service import device_service
 from ..services.alert_service import alert_service
-from ..utils.datetime_utils import current_iso_timestamp
 from ..receiver.tcp_server import send_command_to_device
 from ..config import settings
 
@@ -97,16 +100,27 @@ async def ingest_gps_telemetry(request: Request):
         except (ValueError, TypeError):
             steps = None
 
-        ts = item.get("timestamp") or item.get("time") or current_iso_timestamp()
+        ts = item.get("timestamp") or item.get("time")
 
         # GPS validity: check status flag ('A' vs 'V') and coordinate bounds
         status_flag = str(item.get("status") or item.get("gps_status") or "A").strip().upper()
-        is_coord_valid = (
-            lat is not None and lon is not None
-            and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
-            and not (lat == 0.0 and lon == 0.0)
+        gps_valid_input = item.get("gps_valid", True)
+        if isinstance(gps_valid_input, str):
+            gps_valid_input = gps_valid_input.strip().lower() in {
+                "1", "true", "yes", "a", "valid"
+            }
+        verified_fix = normalize_verified_gps_fix(
+            (status_flag != "V") and is_gps_valid_flag(gps_valid_input),
+            lat,
+            lon,
+            ts,
+            "gps_ingest_api"
         )
-        has_coords = (status_flag != "V") and bool(item.get("gps_valid", True)) and is_coord_valid
+        has_coords = verified_fix is not None
+        if verified_fix is not None:
+            lat, lon, ts, gps_source = verified_fix
+        else:
+            gps_source = None
         gps_status = "GPS Locked" if has_coords else "No Fix"
 
         # Extract course / heading / bearing
@@ -131,7 +145,7 @@ async def ingest_gps_telemetry(request: Request):
             "gps_fix": has_coords,
             "gps_locked": has_coords,
             "gps_status": gps_status,
-            "gps_source": "gps_ingest_api" if has_coords else None,
+            "gps_source": gps_source,
             "latitude": round(lat, 6) if has_coords else None,
             "longitude": round(lon, 6) if has_coords else None,
             "speed_kmh": speed,
@@ -164,8 +178,8 @@ async def ingest_gps_telemetry(request: Request):
             speed=speed,
             bearing=bearing,
             is_charging=is_charging,
-            gps_valid=has_coords,
-            timestamp=ts,
+            gps_valid=bool(record.get("gps_valid")),
+            timestamp=record.get("timestamp"),
             gps_source=record.get("gps_source")
         )
 
@@ -180,8 +194,8 @@ async def ingest_gps_telemetry(request: Request):
             except Exception:
                 pass
 
-        # Check battery alert
-        alert_service.check_battery_alert(dev_id, battery)
+        if battery is not None:
+            alert_service.check_battery_alert(dev_id, battery)
 
         results.append(record)
 
@@ -236,15 +250,15 @@ def get_live_locations():
         if location is None:
             continue
 
-        lat = location["latitude"]
-        lon = location["longitude"]
+        gps_valid = bool(location.get("gps_valid", False))
+        lat = location["latitude"] if gps_valid else None
+        lon = location["longitude"] if gps_valid else None
         name = d.get("wearer_name") or d.get("name") or "Wearer"
         bearing_val = d.get("heading") or d.get("bearing") or d.get("course") or d.get("direction") or 0.0
         speed_val = d.get("speed") or d.get("speed_kmh") or 0.0
         batt_val = d.get("battery")
         is_chg = bool(d.get("is_charging") or d.get("charging") or False)
         gps_status = location.get("gps_status", d.get("gps_status", "No Fix"))
-        gps_valid = bool(location.get("gps_valid", d.get("gps_valid", False)))
 
         point = {
             "id": dev_id,
@@ -273,13 +287,16 @@ def get_live_locations():
             "online": bool(d.get("online", False)),
             "gps_status": gps_status,
             "gps_valid": gps_valid,
-            "gps_fix": bool(location.get("gps_fix", d.get("gps_fix", gps_valid))),
-            "gps_locked": bool(location.get("gps_locked", d.get("gps_locked", gps_valid))),
+            "gps_fix": gps_valid,
+            "gps_locked": gps_valid,
             "last_seen": d.get("last_seen"),
             "last_valid_gps_time": location.get("timestamp") or d.get("last_valid_gps_time"),
             "timestamp": location.get("timestamp") or d.get("last_valid_gps_time"),
-            "gps_source": location.get("gps_source") or d.get("gps_source"),
-            "maps_url": location.get("maps_url") or f"https://maps.google.com/?q={lat},{lon}"
+            "gps_source": location.get("gps_source") if gps_valid else None,
+            "maps_url": (
+                location.get("maps_url") or f"https://maps.google.com/?q={lat},{lon}"
+                if gps_valid else None
+            )
         }
         if batt_val is not None:
             point["battery"] = batt_val
@@ -312,16 +329,15 @@ def get_latest_location(device_id: str):
     speed_val = latest_telemetry.get("speed_kmh") or dev.get("speed") or 0.0
     batt_val = dev.get("battery")
     is_chg = bool(dev.get("is_charging") or dev.get("charging") or False)
-    lat = location["latitude"] if location else None
-    lon = location["longitude"] if location else None
+    gps_valid = bool(location and location.get("gps_valid", False))
+    lat = location["latitude"] if gps_valid else None
+    lon = location["longitude"] if gps_valid else None
     gps_status = (
         location.get("gps_status", dev.get("gps_status", "No Fix"))
         if location else dev.get("gps_status", "No Fix")
     )
-    gps_valid = (
-        bool(location.get("gps_valid", False))
-        if location else bool(dev.get("gps_valid", False))
-    )
+    if not location and gps_status != "Location Stale":
+        gps_status = "No Fix"
 
     res = {
         "device_id": device_id,
@@ -347,8 +363,8 @@ def get_latest_location(device_id: str):
         "online": bool(dev.get("online", False)),
         "gps_status": gps_status,
         "gps_valid": gps_valid,
-        "gps_fix": gps_valid if location else bool(dev.get("gps_fix", False)),
-        "gps_locked": gps_valid if location else bool(dev.get("gps_locked", False)),
+        "gps_fix": gps_valid,
+        "gps_locked": gps_valid,
         "last_seen": dev.get("last_seen"),
         "timestamp": location.get("timestamp") if location else dev.get("last_valid_gps_time"),
         "last_valid_gps_time": (
@@ -356,14 +372,13 @@ def get_latest_location(device_id: str):
             else dev.get("last_valid_gps_time")
         ),
         "gps_source": (
-            location.get("gps_source") if location and location.get("gps_source")
-            else dev.get("gps_source")
+            location.get("gps_source") if gps_valid else None
         ),
         "steps": dev.get("steps"),
         "heart_rate": dev.get("heart_rate"),
         "maps_url": (
-            location.get("maps_url") if location and location.get("maps_url")
-            else (f"https://maps.google.com/?q={lat},{lon}" if lat is not None and lon is not None else dev.get("maps_url"))
+            location.get("maps_url") or f"https://maps.google.com/?q={lat},{lon}"
+            if gps_valid else None
         )
     }
     if batt_val is not None:
@@ -392,13 +407,30 @@ def get_location_history(
             detail=f"Device '{device_id}' not found"
         )
     history = firestore_service.get_telemetry_history(device_id, limit=limit)
+    verified_history = []
     for record in history:
-        gps_valid = bool(record.get("gps_valid", record.get("gps_fix", False)))
-        record["gps_valid"] = gps_valid
-        record["gps_fix"] = gps_valid
-        record["gps_status"] = "GPS Locked" if gps_valid else "No Fix"
-        record["gps_source"] = record.get("gps_source")
-    return history
+        verified_fix = normalize_verified_gps_fix(
+            record.get("gps_valid", record.get("gps_fix", False)),
+            record.get("latitude", record.get("lat")),
+            record.get("longitude", record.get("lon", record.get("lng"))),
+            record.get("timestamp"),
+            record.get("gps_source"),
+            max_age_seconds=None
+        )
+        if verified_fix is None:
+            continue
+        latitude, longitude, timestamp, gps_source = verified_fix
+        record.update({
+            "latitude": latitude,
+            "longitude": longitude,
+            "timestamp": timestamp,
+            "gps_valid": True,
+            "gps_fix": True,
+            "gps_status": "GPS Locked",
+            "gps_source": gps_source
+        })
+        verified_history.append(record)
+    return verified_history
 
 
 @router.post("/{device_id}/poll", response_model=Dict[str, Any])

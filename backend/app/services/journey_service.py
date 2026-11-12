@@ -261,7 +261,7 @@ from typing import Dict, Any, Optional, List
 
 from ..utils.datetime_utils import current_iso_timestamp
 from ..utils.logger import app_logger, gps_logger
-from .firestore_service import firestore_service
+from .firestore_service import firestore_service, normalize_verified_gps_fix
 from .gps_service import gps_service
 
 
@@ -315,14 +315,9 @@ class JourneyService:
             return False
 
     def _get_initial_device_location(
-        self, device: Dict[str, Any], now_iso: str
+        self, device: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """
-        Read the last known valid GPS location.
-
-        Explicit gps_valid=False or GPS status V means the current
-        device fix must not be used as the journey's starting point.
-        """
+        """Read the last known verified GPS location for a journey endpoint."""
 
         lat = device.get("last_latitude")
         lon = device.get("last_longitude")
@@ -333,34 +328,30 @@ class JourneyService:
         if lon is None:
             lon = device.get("longitude")
 
-        if not self._valid_coordinates(lat, lon):
-            return None
-
-        gps_valid = device.get("gps_valid")
         gps_status = str(
             device.get("gps_status")
             or device.get("gps_fix_status")
             or ""
         ).strip().upper()
-
-        if gps_valid is False:
-            return None
-
         if gps_status == "V":
             return None
 
-        # If gps_valid is absent, accept coordinates only when the
-        # device has a last-valid-fix timestamp or an explicit valid
-        # GPS status. This avoids treating arbitrary coordinates as
-        # a confirmed GPS fix.
-        if gps_valid is None and gps_status != "A":
-            if not device.get("last_valid_gps_time"):
-                return None
+        fix = normalize_verified_gps_fix(
+            device.get("gps_valid"),
+            lat,
+            lon,
+            device.get("last_valid_gps_time"),
+            device.get("gps_source"),
+        )
+        if fix is None:
+            return None
+
+        latitude, longitude, timestamp, _ = fix
 
         return {
-            "latitude": round(float(lat), 6),
-            "longitude": round(float(lon), 6),
-            "timestamp": device.get("last_valid_gps_time") or now_iso,
+            "latitude": latitude,
+            "longitude": longitude,
+            "timestamp": timestamp,
             "speed_kmh": float(
                 device.get("speed_kmh") or device.get("speed") or 0.0
             ),
@@ -383,9 +374,7 @@ class JourneyService:
 
         device = firestore_service.get_device(device_id) or {}
 
-        start_location = self._get_initial_device_location(
-            device, now_iso
-        )
+        start_location = self._get_initial_device_location(device)
 
         route_coordinates: List[Dict[str, Any]] = []
 
@@ -569,9 +558,7 @@ class JourneyService:
         if not end_location:
             device = firestore_service.get_device(device_id) or {}
 
-            candidate = self._get_initial_device_location(
-                device, now_iso
-            )
+            candidate = self._get_initial_device_location(device)
 
             if candidate:
                 end_location = candidate

@@ -9,7 +9,6 @@ from ..schemas.device_schema import DeviceCreate, DeviceUpdate, DeviceCommandReq
 from ..services.device_service import device_service
 from ..services.firestore_service import firestore_service
 from ..receiver.tcp_server import send_command_to_device
-from ..utils.datetime_utils import current_iso_timestamp
 from ..config import settings
 
 router = APIRouter(prefix="/devices", tags=["Devices"])
@@ -100,7 +99,7 @@ async def ingest_device(request: Request):
                     "device_id": dev_id,
                     "maker": dev_dict.get("maker", "MNYD"),
                     "command": "UD",
-                    "timestamp": item.get("timestamp") or current_iso_timestamp(),
+                    "timestamp": item.get("timestamp"),
                     "gps_valid": True,
                     "latitude": round(lat, 6),
                     "longitude": round(lon, 6),

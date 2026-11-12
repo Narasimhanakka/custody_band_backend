@@ -5,9 +5,8 @@ Coordinate parsing, Google Maps link generation, distance calculation & geofence
 
 import math
 from typing import Optional, Dict, Any, Tuple
-from ..utils.datetime_utils import current_iso_timestamp
 from ..utils.logger import gps_logger
-from .firestore_service import firestore_service
+from .firestore_service import firestore_service, normalize_verified_gps_fix
 
 
 class GPSService:
@@ -55,19 +54,14 @@ class GPSService:
         """Enriches and persists a location record with dynamic direction angle/bearing."""
         lat = record.get("latitude")
         lon = record.get("longitude")
-
-        # Strict coordinate validation
-        if lat is not None and lon is not None:
-            try:
-                f_lat = float(lat)
-                f_lon = float(lon)
-                is_coord_valid = (-90.0 <= f_lat <= 90.0) and (-180.0 <= f_lon <= 180.0) and not (f_lat == 0.0 and f_lon == 0.0)
-            except (ValueError, TypeError):
-                is_coord_valid = False
-        else:
-            is_coord_valid = False
-
-        is_valid = bool(record.get("gps_valid", False)) and is_coord_valid
+        verified_fix = normalize_verified_gps_fix(
+            record.get("gps_valid"),
+            lat,
+            lon,
+            record.get("timestamp"),
+            record.get("gps_source")
+        )
+        is_valid = verified_fix is not None
         record["gps_valid"] = is_valid
         record["gps_fix"] = is_valid
         record["gps_locked"] = is_valid
@@ -103,9 +97,12 @@ class GPSService:
         record["angle"] = bearing
         record["rotation"] = bearing
 
-        if is_valid and lat is not None and lon is not None:
-            record["latitude"] = round(float(lat), 6)
-            record["longitude"] = round(float(lon), 6)
+        if verified_fix is not None:
+            lat, lon, timestamp, source = verified_fix
+            record["timestamp"] = timestamp
+            record["gps_source"] = source
+            record["latitude"] = lat
+            record["longitude"] = lon
             record["maps_url"] = self.build_maps_url(float(lat), float(lon))
             gps_logger.info(
                 f"[GPS FIX] Device {record['device_id']} at ({float(lat):.6f}, {float(lon):.6f}) - Heading: {bearing}° - {record['maps_url']}"
@@ -117,7 +114,7 @@ class GPSService:
                     device_id=record["device_id"],
                     latitude=float(lat),
                     longitude=float(lon),
-                    timestamp=record.get("timestamp") or current_iso_timestamp(),
+                    timestamp=record["timestamp"],
                     speed_kmh=float(record.get("speed_kmh") or record.get("speed") or 0.0)
                 )
             except Exception as e:
@@ -125,13 +122,15 @@ class GPSService:
         else:
             record["latitude"] = None
             record["longitude"] = None
+            record["gps_source"] = None
             record["maps_url"] = None
             batt_info = f"Battery: {record.get('battery')}%" if record.get('battery') is not None else "Battery: N/A"
             gps_logger.info(
                 f"[NO FIX] Device {record['device_id']} GPS invalid/indoor ({batt_info}, Steps: {record.get('steps')})"
             )
 
-        firestore_service.save_telemetry(record, wait_for_firestore=is_valid)
+        if is_valid:
+            firestore_service.save_telemetry(record, wait_for_firestore=True)
         return record
 
 

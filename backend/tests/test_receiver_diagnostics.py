@@ -1,5 +1,6 @@
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -75,6 +76,34 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
             [packet_parser.build_frame("MNYD", "TEST_DEVICE_1", "PING,1")]
         )
 
+    def test_tcp_gps_packet_is_dispatched_with_trusted_source_and_watch_time(self):
+        packet_time = datetime.now(timezone.utc)
+        payload = (
+            f"UD,{packet_time:%y%m%d},{packet_time:%H%M%S},A,"
+            "17.445000,N,78.370000,E,0.0,90.0,0.0,0,0,,,00000000"
+        )
+        frame = packet_parser.build_frame("MNYD", "TEST_DEVICE_GPS", payload)
+        connection = FakeTCPConnection([frame])
+
+        with (
+            patch.object(
+                packet_parser.gps_service,
+                "process_location_record",
+                side_effect=lambda record: record
+            ) as process_record,
+            patch.object(packet_parser.device_service, "update_position") as update_position
+        ):
+            tcp_server.handle_tcp_client(connection, ("127.0.0.1", 12346))
+
+        record = process_record.call_args.args[0]
+        self.assertTrue(record["gps_valid"])
+        self.assertEqual(record["gps_source"], "watch_tcp")
+        self.assertEqual(
+            record["timestamp"],
+            packet_time.replace(microsecond=0).isoformat()
+        )
+        self.assertEqual(update_position.call_args.kwargs["gps_source"], "watch_tcp")
+
     def test_udp_frame_diagnostics_and_protocol_reply(self):
         frame = packet_parser.build_frame("MNYD", "TEST_DEVICE_2", "PING")
         udp_socket = FakeUDPSocket(frame)
@@ -125,7 +154,9 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
             ),
             self.assertLogs("custody_tcp", level="ERROR") as captured
         ):
-            result = packet_parser.parse_ud(packet, "TEST_DEVICE_ERROR", "MNYD")
+            result = packet_parser.parse_ud(
+                packet, "TEST_DEVICE_ERROR", "MNYD", gps_source="watch_tcp"
+            )
 
         self.assertIsNone(result)
         logs = "\n".join(captured.output)
@@ -133,10 +164,12 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("SENSITIVE_PAYLOAD", logs)
 
     def test_gps_diagnostic_reports_validation_and_completed_stages(self):
+        packet_time = datetime.now(timezone.utc)
         packet = (
-            b"UD,261106,110000,A,17.445000,N,78.370000,E,"
-            b"16.5,142.0,510.0,8,95,73,1250,00000000,0,0,0,0,0"
-        )
+            f"UD,{packet_time:%y%m%d},{packet_time:%H%M%S},A,"
+            "17.445000,N,78.370000,E,16.5,142.0,510.0,8,95,73,1250,"
+            "00000000,0,0,0,0,0"
+        ).encode("latin-1")
         with (
             patch.object(packet_parser, "_DIAGNOSTICS_ENABLED", True),
             patch.object(
@@ -148,7 +181,9 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
             patch.object(packet_parser.alert_service, "check_battery_alert"),
             self.assertLogs("custody_gps", level="INFO") as captured
         ):
-            record = packet_parser.parse_ud(packet, "TEST_DEVICE_4", "MNYD")
+            record = packet_parser.parse_ud(
+                packet, "TEST_DEVICE_4", "MNYD", gps_source="watch_tcp"
+            )
 
         self.assertTrue(record["gps_valid"])
         self.assertIn("status=A coordinates_valid=True", "\n".join(captured.output))
@@ -173,7 +208,9 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
             patch.object(packet_parser.alert_service, "check_battery_alert"),
             self.assertLogs("custody_gps", level="INFO") as captured
         ):
-            record = packet_parser.parse_ud(packet, "TEST_DEVICE_5", "MNYD")
+            record = packet_parser.parse_ud(
+                packet, "TEST_DEVICE_5", "MNYD", gps_source="watch_tcp"
+            )
 
         self.assertFalse(record["gps_valid"])
         self.assertIsNone(record["latitude"])
