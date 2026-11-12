@@ -3,8 +3,11 @@ Packet Parser for Huaten C05 GPS Custody Watch
 Decodes command payloads: PING, KA, UD (GPS), CRUD (Polled GPS), heart, and AL (Alarms).
 """
 
+import os
+import re
+import traceback
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple
-from ..utils.datetime_utils import current_iso_timestamp
 from ..utils.logger import tcp_logger, gps_logger
 from ..services.gps_service import gps_service
 from ..services.device_service import device_service
@@ -17,12 +20,32 @@ REPLIES = {
     "heart": "heart",
     "AL": "AL",
 }
+_DIAGNOSTICS_ENABLED = os.getenv("GPS_RECEIVER_DIAGNOSTICS", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+
+def _log_gps_diagnostic(message: str, *args):
+    if _DIAGNOSTICS_ENABLED:
+        gps_logger.info(message, *args)
 
 
 def build_frame(maker: str, dev_id: str, content: str) -> bytes:
     """Builds a compliant [MAKER*ID*HEX_LEN*CONTENT] frame."""
     body = content.encode("latin-1")
     return b"[%s*%s*%04X*%s]" % (maker.encode("latin-1"), dev_id.encode("latin-1"), len(body), body)
+
+
+def _parse_watch_gps_timestamp(date_value: str, time_value: str) -> Optional[str]:
+    if not re.fullmatch(r"\d{6}", date_value) or not re.fullmatch(r"\d{6}", time_value):
+        return None
+    try:
+        timestamp = datetime.strptime(
+            f"{date_value}{time_value}", "%y%m%d%H%M%S"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return timestamp.isoformat()
 
 
 def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, Any]]:
@@ -49,12 +72,19 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
         msg = content.decode("latin-1", errors="ignore")
         fields = msg.split(",")
         if len(fields) < 15:
+            _log_gps_diagnostic(
+                "GPS packet rejected device=%s command=%s reason=insufficient_fields field_count=%d",
+                device_id,
+                fields[0].strip() if fields else "UNKNOWN",
+                len(fields)
+            )
             return None
 
         cmd = fields[0].strip()
         date_str = fields[1].strip()
         time_str = fields[2].strip()
         status = fields[3].strip().upper()
+        gps_timestamp = _parse_watch_gps_timestamp(date_str, time_str)
 
         # Coordinate parsing and strict validation
         try:
@@ -73,7 +103,15 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
 
         # Coordinate boundary checks (-90 <= lat <= 90, -180 <= lon <= 180, not 0,0)
         is_valid_coords = (-90.0 <= lat <= 90.0) and (-180.0 <= lon <= 180.0) and not (lat == 0.0 and lon == 0.0)
-        is_valid_gps = (status == "A") and is_valid_coords
+        is_valid_gps = (status == "A") and is_valid_coords and gps_timestamp is not None
+        _log_gps_diagnostic(
+            "GPS packet device=%s command=%s status=%s coordinates_valid=%s timestamp_valid=%s",
+            device_id,
+            cmd,
+            status,
+            is_valid_coords,
+            gps_timestamp is not None
+        )
 
         try:
             speed = float(fields[8].strip()) if len(fields) > 8 and fields[8].strip() else 0.0
@@ -108,13 +146,14 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
             "device_id": device_id,
             "maker": maker,
             "command": cmd,
-            "timestamp": current_iso_timestamp(),
+            "timestamp": gps_timestamp,
             "watch_date": date_str,
             "watch_time_utc": time_str,
             "gps_valid": is_valid_gps,
             "gps_fix": is_valid_gps,
             "gps_locked": is_valid_gps,
             "gps_status": gps_status,
+            "gps_source": "watch_tcp" if is_valid_gps else None,
             "latitude": round(lat, 6) if is_valid_gps else None,
             "longitude": round(lon, 6) if is_valid_gps else None,
             "speed_kmh": speed,
@@ -145,7 +184,8 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
             record["nearby_wifi_count"] = int(fields[24].strip())
 
         # Process through GPS service and Device service
-        gps_service.process_location_record(record)
+        processed_record = gps_service.process_location_record(record)
+        gps_processing_succeeded = processed_record is record
         device_service.update_position(
             device_id=device_id,
             lat=round(lat, 6) if is_valid_gps else None,
@@ -157,7 +197,20 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
             is_charging=is_charging,
             gps_valid=is_valid_gps,
             satellites=satellites,
-            gsm_signal=gsm_signal
+            gsm_signal=gsm_signal,
+            timestamp=gps_timestamp,
+            gps_source=record.get("gps_source")
+        )
+        device_position_update_succeeded = True
+        _log_gps_diagnostic(
+            "GPS processing device=%s command=%s status=%s coordinates_valid=%s "
+            "gps_processing_succeeded=%s device_position_update_succeeded=%s",
+            device_id,
+            cmd,
+            status,
+            is_valid_coords,
+            gps_processing_succeeded,
+            device_position_update_succeeded
         )
 
         if battery is not None:
@@ -175,8 +228,13 @@ def parse_ud(content: bytes, device_id: str, maker: str) -> Optional[Dict[str, A
 
         return record
 
-    except Exception as e:
-        tcp_logger.error(f"Error parsing UD packet: {e}")
+    except Exception as exc:
+        tcp_logger.error(
+            "Error parsing GPS packet device=%s exception_type=%s stack=%s",
+            device_id,
+            type(exc).__name__,
+            "".join(traceback.format_tb(exc.__traceback__))
+        )
         return None
 
 
@@ -188,7 +246,7 @@ def parse_packet(maker: str, dev_id: str, content: bytes) -> Tuple[Optional[str]
     cmd = msg.split(",")[0]
     reply_bytes = None
 
-    tcp_logger.info(f"[{maker}*{dev_id}] Recv -> {msg}")
+    tcp_logger.info(f"[{maker}*{dev_id}] Recv command={cmd}")
 
     # Build acknowledgment reply if required by protocol
     if cmd in REPLIES:
@@ -268,4 +326,3 @@ def parse_packet(maker: str, dev_id: str, content: bytes) -> Tuple[Optional[str]
             alert_service.check_battery_alert(dev_id, bat)
 
     return cmd, reply_bytes
-

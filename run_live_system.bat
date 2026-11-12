@@ -15,16 +15,20 @@ if exist "..\venv\Scripts\python.exe" (
 echo Waiting for backend server to initialize...
 timeout /t 4 /nobreak >nul
 
-echo [2/2] Starting Live Traveling GPS Stream (90%% Battery & Rotating Heading Arrow)...
 echo Check your Chrome tabs:
 echo   - Swagger Docs: http://127.0.0.1:8000/docs
 echo   - Web App Map : https://custody-band-a8f59.web.app/admin/dashboard
 echo ===================================================================
-if exist "..\venv\Scripts\python.exe" (
-    "..\venv\Scripts\python.exe" simulate_gps.py --loop
+if /I "%~1"=="--simulate" (
+    echo Starting demo GPS stream on a separate simulator device...
+    if exist "..\venv\Scripts\python.exe" (
+        "..\venv\Scripts\python.exe" simulate_gps.py --loop
+    ) else (
+        python simulate_gps.py --loop
+    )
 ) else (
-    python simulate_gps.py --loop
+    echo Demo GPS stream is off. Only real watch telemetry will update device locations.
+    echo To run an isolated demo stream, start this script with --simulate.
 )
 
 pause
-

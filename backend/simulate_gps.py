@@ -11,6 +11,7 @@ import time
 import socket
 import json
 import math
+import os
 import urllib.request
 from datetime import datetime, timezone
 
@@ -18,7 +19,7 @@ from datetime import datetime, timezone
 HOST = "127.0.0.1"
 API_PORT = 8000
 TCP_PORT = 9001
-DEVICE_IMEI = "863758061830955"
+DEVICE_IMEI = os.environ.get("SIMULATOR_DEVICE_ID", "SIMULATOR_863758061830955")
 MAKER = "MNYD"
 BATTERY_LEVEL = 90
 

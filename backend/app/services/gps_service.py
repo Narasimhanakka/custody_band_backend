@@ -131,7 +131,7 @@ class GPSService:
                 f"[NO FIX] Device {record['device_id']} GPS invalid/indoor ({batt_info}, Steps: {record.get('steps')})"
             )
 
-        firestore_service.save_telemetry(record)
+        firestore_service.save_telemetry(record, wait_for_firestore=is_valid)
         return record
 
 

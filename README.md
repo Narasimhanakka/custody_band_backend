@@ -164,6 +164,8 @@ python simulate_watch.py
 
 The simulator will replay real `PING`, `KA`, `UD` (GPS: `17.446317, 78.368395`), and `heart` (96 BPM) frames.
 
+The moving GPS demo is isolated from the real custody watch. `run_live_system.bat` starts only the backend by default; pass `--simulate` to start the demo stream. The moving simulator uses device ID `SIMULATOR_863758061830955` by default, so its sample coordinates and 90% battery do not overwrite the real watch.
+
 ---
 
 ## API Documentation & Endpoint Structure
@@ -201,4 +203,3 @@ The API is structured into 4 distinct modules:
 * `GET  /api/v1/dashboard/devices/{device_id}/history` - Historical GPS trail
 * `POST /api/v1/dashboard/devices/{device_id}/command` - Send instant command to watch (`CR` for live location)
 * `GET  /api/v1/dashboard/alerts` - Recent security alarms (SOS, strap cut, low battery)
-

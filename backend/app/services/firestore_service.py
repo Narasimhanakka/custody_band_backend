@@ -5,11 +5,14 @@ Uses real device telemetry without mock defaults.
 """
 
 import json
+import math
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+from google.cloud import firestore as cloud_firestore
 from ..core.firebase import get_firestore_client, is_firebase_active
 from ..utils.logger import app_logger
 from ..utils.datetime_utils import current_iso_timestamp
@@ -18,9 +21,90 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 LOCAL_DB = BASE_DIR / "custody_watch.db"
 
 
+def parse_iso_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value is not None:
+        try:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def normalize_iso_timestamp(value: Any) -> Optional[str]:
+    parsed = parse_iso_timestamp(value)
+    return parsed.isoformat() if parsed else None
+
+
+def is_newer_timestamp(incoming: Any, existing: Any, allow_equal: bool = False) -> bool:
+    incoming_dt = parse_iso_timestamp(incoming)
+    if incoming_dt is None:
+        return False
+    existing_dt = parse_iso_timestamp(existing)
+    if existing_dt is None:
+        return True
+    return incoming_dt >= existing_dt if allow_equal else incoming_dt > existing_dt
+
+
+def valid_coordinate_pair(latitude: Any, longitude: Any) -> Optional[Tuple[float, float]]:
+    try:
+        lat = float(latitude)
+        lon = float(longitude)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(lat)
+        or not math.isfinite(lon)
+        or not -90.0 <= lat <= 90.0
+        or not -180.0 <= lon <= 180.0
+        or (lat == 0.0 and lon == 0.0)
+    ):
+        return None
+    return lat, lon
+
+
 class FirestoreService:
+    DEVICE_CACHE_TTL_SECONDS = 10
+    DEVICES_CACHE_TTL_SECONDS = 30
+
     def __init__(self):
+        self._firestore_history_sync_lock = threading.Lock()
+        self._device_cache_lock = threading.RLock()
+        self._device_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._devices_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
         self._init_local_db()
+
+    def _cached_device(
+        self, device_id: str, allow_expired: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        with self._device_cache_lock:
+            cached = self._device_cache.get(device_id)
+        if cached is None:
+            return None
+        if (
+            allow_expired
+            or time.monotonic() - cached[0] < self.DEVICE_CACHE_TTL_SECONDS
+        ):
+            return dict(cached[1])
+        return None
+
+    def _cache_device(self, device_id: str, device: Dict[str, Any]) -> None:
+        with self._device_cache_lock:
+            self._device_cache[device_id] = (time.monotonic(), dict(device))
+
+    def _invalidate_device_caches(self, device_id: Optional[str] = None) -> None:
+        with self._device_cache_lock:
+            if device_id is None:
+                self._device_cache.clear()
+            else:
+                self._device_cache.pop(device_id, None)
+            self._devices_cache = None
 
     def _init_local_db(self):
         """Prepares local SQLite tables for fallback persistence."""
@@ -39,7 +123,8 @@ class FirestoreService:
                 status TEXT,
                 last_latitude REAL,
                 last_longitude REAL,
-                maps_url TEXT
+                maps_url TEXT,
+                gps_source TEXT
             )
         """)
         cur.execute("""
@@ -54,6 +139,14 @@ class FirestoreService:
                 battery INTEGER,
                 steps INTEGER,
                 maps_url TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS firestore_history_sync (
+                device_id TEXT PRIMARY KEY,
+                watermark TEXT,
+                watermark_kind TEXT,
+                checked_at REAL NOT NULL DEFAULT 0
             )
         """)
         cur.execute("""
@@ -115,7 +208,7 @@ class FirestoreService:
                     cur.execute(f"ALTER TABLE devices ADD COLUMN {col} INTEGER DEFAULT 0")
                 except Exception:
                     pass
-        for col in ["last_valid_gps_time", "gps_status", "satellites", "gsm_signal"]:
+        for col in ["last_valid_gps_time", "gps_status", "satellites", "gsm_signal", "gps_source"]:
             if col not in existing_device_cols:
                 try:
                     cur.execute(f"ALTER TABLE devices ADD COLUMN {col} TEXT")
@@ -142,6 +235,21 @@ class FirestoreService:
                     cur.execute(f"ALTER TABLE telemetry ADD COLUMN {col} INTEGER DEFAULT 0")
                 except Exception:
                     pass
+        if "gps_source" not in existing_telem_cols:
+            try:
+                cur.execute("ALTER TABLE telemetry ADD COLUMN gps_source TEXT")
+            except Exception:
+                pass
+        if "firestore_document_id" not in existing_telem_cols:
+            try:
+                cur.execute("ALTER TABLE telemetry ADD COLUMN firestore_document_id TEXT")
+            except Exception:
+                pass
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_firestore_document_id
+            ON telemetry(firestore_document_id)
+            WHERE firestore_document_id IS NOT NULL
+        """)
 
         conn.commit()
         conn.close()
@@ -263,80 +371,151 @@ class FirestoreService:
         dev_id = device_data["device_id"]
         batt_val = device_data.get("battery") if device_data.get("battery") is not None else device_data.get("battery_level")
         steps_val = device_data.get("steps")
-        is_charging_val = 1 if (device_data.get("is_charging") or device_data.get("charging")) else 0
+        charging_value = device_data.get("is_charging")
+        if charging_value is None:
+            charging_value = device_data.get("charging")
+        has_charging_value = charging_value is not None
+        is_charging_val = 1 if charging_value else 0
         heading_val = (
             device_data.get("heading")
             if device_data.get("heading") is not None
             else (device_data.get("bearing") if device_data.get("bearing") is not None else device_data.get("course"))
         )
         speed_val = device_data.get("speed_kmh") if device_data.get("speed_kmh") is not None else device_data.get("speed")
-        last_lat = device_data.get("last_latitude")
-        last_lon = device_data.get("last_longitude")
-        last_valid_gps_time = device_data.get("last_valid_gps_time")
-        gps_status = device_data.get("gps_status", "No Fix")
+        incoming_lat = device_data.get("last_latitude")
+        if incoming_lat is None:
+            incoming_lat = device_data.get("latitude", device_data.get("lat"))
+        incoming_lon = device_data.get("last_longitude")
+        if incoming_lon is None:
+            incoming_lon = device_data.get("longitude", device_data.get("lon", device_data.get("lng")))
+        incoming_fix_time = normalize_iso_timestamp(device_data.get("last_valid_gps_time"))
+        incoming_position = valid_coordinate_pair(incoming_lat, incoming_lon)
+        incoming_fix_is_valid = bool(device_data.get("gps_valid")) and incoming_position is not None and incoming_fix_time is not None
+        gps_state_supplied = "gps_valid" in device_data or "gps_status" in device_data
+        received_at = normalize_iso_timestamp(device_data.get("last_seen")) or current_iso_timestamp()
 
         # 1. Local SQLite Backup
         try:
             conn = sqlite3.connect(str(LOCAL_DB))
             cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            existing = cur.execute(
+                "SELECT * FROM devices WHERE device_id = ?", (dev_id,)
+            ).fetchone()
+            columns = [column[1] for column in cur.execute("PRAGMA table_info(devices)").fetchall()]
+            previous = dict(zip(columns, existing)) if existing else {}
+
+            last_lat = previous.get("last_latitude")
+            last_lon = previous.get("last_longitude")
+            last_valid_gps_time = previous.get("last_valid_gps_time")
+            maps_url = previous.get("maps_url")
+            accepted_fix = (
+                incoming_fix_is_valid
+                and is_newer_timestamp(incoming_fix_time, last_valid_gps_time)
+            )
+            gps_source_value = (
+                device_data.get("gps_source") if accepted_fix else previous.get("gps_source")
+            )
+            if accepted_fix and incoming_position is not None:
+                last_lat, last_lon = incoming_position
+                last_valid_gps_time = incoming_fix_time
+                maps_url = f"https://maps.google.com/?q={last_lat:.6f},{last_lon:.6f}"
+
+            state_is_newer = gps_state_supplied and is_newer_timestamp(
+                received_at, previous.get("last_seen"), allow_equal=True
+            )
+            gps_valid_value = (
+                1 if device_data.get("gps_valid") else 0
+            ) if state_is_newer else previous.get("gps_valid", 0)
+            gps_status_value = (
+                device_data.get("gps_status", "No Fix")
+            ) if state_is_newer else previous.get("gps_status", "No Fix")
+            last_seen_value = (
+                received_at
+                if is_newer_timestamp(received_at, previous.get("last_seen"), allow_equal=True)
+                else previous.get("last_seen")
+            )
+            battery_value = batt_val if batt_val is not None else previous.get("battery")
+            steps_value = steps_val if steps_val is not None else previous.get("steps")
+            heart_rate_value = (
+                device_data.get("heart_rate")
+                if device_data.get("heart_rate") is not None
+                else previous.get("heart_rate")
+            )
+            charging_db_value = (
+                is_charging_val if has_charging_value else previous.get("is_charging", 0)
+            )
+            heading_db_value = (
+                float(heading_val)
+                if heading_val is not None
+                else previous.get("heading")
+            )
+            speed_db_value = (
+                float(speed_val)
+                if speed_val is not None
+                else previous.get("speed")
+            )
+
             cur.execute("""
                 INSERT INTO devices (
                     device_id, maker, wearer_name, case_number, last_seen,
                     battery, steps, heart_rate, status, last_latitude, last_longitude, maps_url,
-                    heading, bearing, course, speed, is_charging, last_valid_gps_time, gps_status, gps_valid
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    heading, bearing, course, speed, is_charging, last_valid_gps_time, gps_status, gps_valid,
+                    gps_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
-                    maker = COALESCE(excluded.maker, devices.maker),
-                    wearer_name = COALESCE(excluded.wearer_name, devices.wearer_name),
-                    case_number = COALESCE(excluded.case_number, devices.case_number),
-                    last_seen = COALESCE(excluded.last_seen, devices.last_seen),
-                    battery = CASE 
-                        WHEN excluded.battery IS NOT NULL THEN excluded.battery 
-                        ELSE devices.battery 
-                    END,
-                    steps = CASE 
-                        WHEN excluded.steps IS NOT NULL THEN excluded.steps 
-                        ELSE devices.steps 
-                    END,
-                    heart_rate = COALESCE(excluded.heart_rate, devices.heart_rate),
-                    status = COALESCE(excluded.status, devices.status),
-                    last_latitude = COALESCE(excluded.last_latitude, devices.last_latitude),
-                    last_longitude = COALESCE(excluded.last_longitude, devices.last_longitude),
-                    maps_url = COALESCE(excluded.maps_url, devices.maps_url),
-                    heading = COALESCE(excluded.heading, devices.heading),
-                    bearing = COALESCE(excluded.bearing, devices.bearing),
-                    course = COALESCE(excluded.course, devices.course),
-                    speed = COALESCE(excluded.speed, devices.speed),
-                    is_charging = COALESCE(excluded.is_charging, devices.is_charging),
-                    last_valid_gps_time = COALESCE(excluded.last_valid_gps_time, devices.last_valid_gps_time),
-                    gps_status = COALESCE(excluded.gps_status, devices.gps_status),
-                    gps_valid = COALESCE(excluded.gps_valid, devices.gps_valid)
+                    maker = excluded.maker,
+                    wearer_name = excluded.wearer_name,
+                    case_number = excluded.case_number,
+                    last_seen = excluded.last_seen,
+                    battery = excluded.battery,
+                    steps = excluded.steps,
+                    heart_rate = excluded.heart_rate,
+                    status = excluded.status,
+                    last_latitude = excluded.last_latitude,
+                    last_longitude = excluded.last_longitude,
+                    maps_url = excluded.maps_url,
+                    heading = excluded.heading,
+                    bearing = excluded.bearing,
+                    course = excluded.course,
+                    speed = excluded.speed,
+                    is_charging = excluded.is_charging,
+                    last_valid_gps_time = excluded.last_valid_gps_time,
+                    gps_status = excluded.gps_status,
+                    gps_valid = excluded.gps_valid,
+                    gps_source = excluded.gps_source
             """, (
                 dev_id,
-                device_data.get("maker"),
-                device_data.get("wearer_name"),
-                device_data.get("case_number"),
-                device_data.get("last_seen"),
-                batt_val,
-                steps_val,
-                device_data.get("heart_rate"),
-                device_data.get("status", "ACTIVE"),
+                device_data.get("maker") or previous.get("maker"),
+                device_data.get("wearer_name") or previous.get("wearer_name"),
+                device_data.get("case_number") or previous.get("case_number"),
+                last_seen_value,
+                battery_value,
+                steps_value,
+                heart_rate_value,
+                device_data.get("status", previous.get("status", "ACTIVE")),
                 last_lat,
                 last_lon,
-                device_data.get("maps_url"),
-                float(heading_val) if heading_val is not None else None,
-                float(heading_val) if heading_val is not None else None,
-                float(heading_val) if heading_val is not None else None,
-                float(speed_val) if speed_val is not None else None,
-                is_charging_val,
+                maps_url,
+                heading_db_value,
+                heading_db_value,
+                heading_db_value,
+                speed_db_value,
+                charging_db_value,
                 last_valid_gps_time,
-                gps_status,
-                1 if device_data.get("gps_valid") else 0
+                gps_status_value,
+                gps_valid_value,
+                gps_source_value
             ))
             conn.commit()
-            conn.close()
         except Exception as e:
+            if "conn" in locals():
+                conn.rollback()
             app_logger.error(f"SQLite save_device error: {e}")
+        finally:
+            if "conn" in locals():
+                conn.close()
+        self._invalidate_device_caches(dev_id)
 
         # 2. Asynchronous Firestore Sync
         if is_firebase_active():
@@ -344,29 +523,50 @@ class FirestoreService:
                 try:
                     db = get_firestore_client()
                     if db:
-                        h = float(heading_val or 0.0)
-                        spd = float(speed_val or 0.0)
-                        ts = device_data.get("last_seen") or current_iso_timestamp()
-                        is_valid_fix = bool(device_data.get("gps_valid", False))
-
+                        ts = received_at
                         sync_doc: Dict[str, Any] = {
-                            **device_data,
-                            "heading": h,
-                            "bearing": h,
-                            "course": h,
-                            "direction": h,
-                            "direction_deg": h,
-                            "angle": h,
-                            "rotation": h,
-                            "speed": spd,
-                            "speed_kmh": spd,
-                            "status": device_data.get("status", "ONLINE"),
-                            "last_seen": ts,
-                            "gps_valid": is_valid_fix,
-                            "gps_fix": is_valid_fix,
-                            "gps_locked": is_valid_fix,
-                            "gps_status": gps_status,
+                            key: value for key, value in device_data.items()
+                            if value is not None
                         }
+                        for key in (
+                            "last_latitude", "last_longitude", "latitude", "longitude",
+                            "lat", "lon", "lng", "last_valid_gps_time", "maps_url", "latest",
+                            "last_fix", "gps_source", "gps_valid", "gps_fix", "gps_locked",
+                            "gps_status"
+                        ):
+                            sync_doc.pop(key, None)
+
+                        sync_doc["status"] = device_data.get("status", "ONLINE")
+                        sync_doc["last_seen"] = ts
+
+                        if heading_val is not None:
+                            h = float(heading_val)
+                            sync_doc.update({
+                                "heading": h,
+                                "bearing": h,
+                                "course": h,
+                                "direction": h,
+                                "direction_deg": h,
+                                "angle": h,
+                                "rotation": h
+                            })
+                        else:
+                            h = 0.0
+                        if speed_val is not None:
+                            spd = float(speed_val)
+                            sync_doc["speed"] = spd
+                            sync_doc["speed_kmh"] = spd
+                        else:
+                            spd = 0.0
+
+                        if gps_state_supplied:
+                            is_valid_fix = bool(device_data.get("gps_valid", False))
+                            sync_doc.update({
+                                "gps_valid": is_valid_fix,
+                                "gps_fix": is_valid_fix,
+                                "gps_locked": is_valid_fix,
+                                "gps_status": device_data.get("gps_status", "No Fix")
+                            })
 
                         if batt_val is not None:
                             sync_doc["battery"] = batt_val
@@ -374,34 +574,47 @@ class FirestoreService:
                             sync_doc["battery_level"] = batt_val
                             sync_doc["charge"] = batt_val
 
-                        # Coordinates
-                        if last_lat is not None and last_lon is not None:
-                            sync_doc["last_latitude"] = last_lat
-                            sync_doc["last_longitude"] = last_lon
-                            sync_doc["lat"] = last_lat
-                            sync_doc["lon"] = last_lon
-                            sync_doc["latitude"] = last_lat
-                            sync_doc["longitude"] = last_lon
-                            if last_valid_gps_time:
-                                sync_doc["last_valid_gps_time"] = last_valid_gps_time
-
+                        location = incoming_position if incoming_fix_is_valid else None
+                        if location is not None and incoming_fix_time is not None:
+                            lat, lon = location
+                            sync_doc.update({
+                                "last_latitude": lat,
+                                "last_longitude": lon,
+                                "lat": lat,
+                                "lon": lon,
+                                "latitude": lat,
+                                "longitude": lon,
+                                "last_valid_gps_time": incoming_fix_time,
+                                "maps_url": f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+                            })
+                            gps_source = device_data.get("gps_source")
+                            if gps_source:
+                                sync_doc["gps_source"] = gps_source
+                                sync_doc["last_fix"] = {
+                                    "at": incoming_fix_time,
+                                    "lat": lat,
+                                    "lon": lon,
+                                    "gps_source": gps_source,
+                                    "gps_valid": True
+                                }
                             sync_doc["latest"] = {
                                 "location": {
-                                    "lat": last_lat,
-                                    "lon": last_lon,
-                                    "latitude": last_lat,
-                                    "longitude": last_lon,
+                                    "lat": lat,
+                                    "lon": lon,
+                                    "latitude": lat,
+                                    "longitude": lon,
                                     "direction_deg": h,
                                     "heading": h,
                                     "bearing": h,
                                     "course": h,
                                     "speed_kmh": spd,
-                                    "gps_fix": is_valid_fix,
-                                    "gps_valid": is_valid_fix,
-                                    "gps_locked": is_valid_fix,
-                                    "gps_status": gps_status,
+                                    "gps_fix": True,
+                                    "gps_valid": True,
+                                    "gps_locked": True,
+                                    "gps_status": "GPS Locked",
+                                    "gps_source": gps_source,
                                     "device_id": dev_id,
-                                    "gps_time": last_valid_gps_time or ts,
+                                    "gps_time": incoming_fix_time,
                                     "received_at": ts
                                 },
                                 "status": {
@@ -414,17 +627,71 @@ class FirestoreService:
                                 sync_doc["latest"]["location"]["battery_percent"] = batt_val
                                 sync_doc["latest"]["status"]["battery_percent"] = batt_val
 
-                        db.collection("devices").document(dev_id).set(sync_doc, merge=True)
+                        self._merge_firestore_device(
+                            db,
+                            dev_id,
+                            sync_doc,
+                            event_time=ts,
+                            location_time=incoming_fix_time,
+                            has_valid_location=location is not None
+                        )
                 except Exception as e:
                     app_logger.error(f"Firestore save_device sync error for {dev_id}: {e}")
 
             threading.Thread(target=_bg_sync, daemon=True).start()
+
+    @staticmethod
+    def _merge_firestore_device(
+        db: Any,
+        device_id: str,
+        update_data: Dict[str, Any],
+        event_time: Any,
+        location_time: Any = None,
+        has_valid_location: bool = False
+    ):
+        """Atomically merge device telemetry without allowing an older fix to win."""
+        doc_ref = db.collection("devices").document(device_id)
+        location_fields = {
+            "last_latitude", "last_longitude", "latitude", "longitude", "lat",
+            "lon", "lng", "last_valid_gps_time", "last_fix", "gps_source", "maps_url",
+            "latest"
+        }
+        gps_state_fields = {"gps_valid", "gps_fix", "gps_locked", "gps_status"}
+
+        @cloud_firestore.transactional
+        def _apply(transaction):
+            snapshot = doc_ref.get(transaction=transaction)
+            current = snapshot.to_dict() if snapshot.exists else {}
+            patch = dict(update_data)
+
+            if not is_newer_timestamp(event_time, current.get("last_seen"), allow_equal=True):
+                for key in gps_state_fields:
+                    patch.pop(key, None)
+            if not has_valid_location or not is_newer_timestamp(
+                location_time, current.get("last_valid_gps_time")
+            ):
+                for key in location_fields:
+                    patch.pop(key, None)
+            if not is_newer_timestamp(event_time, current.get("last_seen"), allow_equal=True):
+                patch["last_seen"] = current.get("last_seen")
+
+            transaction.set(doc_ref, patch, merge=True)
+
+        _apply(db.transaction())
 
     def get_devices(self) -> List[Dict[str, Any]]:
         """
         Fetches all devices from Firebase Firestore when active;
         falls back to SQLite with explicit logging if Firebase is offline.
         """
+        with self._device_cache_lock:
+            cached_devices = self._devices_cache
+        if (
+            cached_devices
+            and time.monotonic() - cached_devices[0] < self.DEVICES_CACHE_TTL_SECONDS
+        ):
+            return [self._enrich_device_dict(dict(device)) for device in cached_devices[1]]
+
         if is_firebase_active():
             try:
                 db = get_firestore_client()
@@ -436,9 +703,13 @@ class FirestoreService:
                         d["device_id"] = doc.id
                         devices.append(self._enrich_device_dict(d))
                     if devices:
+                        with self._device_cache_lock:
+                            self._devices_cache = (time.monotonic(), [dict(d) for d in devices])
                         return devices
             except Exception as e:
                 app_logger.error(f"Firestore get_devices failed: {e}. Falling back to SQLite.")
+                if cached_devices:
+                    return [self._enrich_device_dict(dict(device)) for device in cached_devices[1]]
 
         # SQLite fallback
         app_logger.warning("Retrieving devices from local SQLite fallback storage.")
@@ -451,6 +722,8 @@ class FirestoreService:
         for r in rows:
             d = dict(r)
             formatted.append(self._enrich_device_dict(d))
+        with self._device_cache_lock:
+            self._devices_cache = (time.monotonic(), [dict(d) for d in formatted])
         return formatted
 
     def get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
@@ -458,6 +731,10 @@ class FirestoreService:
         Fetches single device details from Firestore when active;
         falls back to SQLite with explicit logging if Firebase is offline.
         """
+        cached_device = self._cached_device(device_id)
+        if cached_device is not None:
+            return self._enrich_device_dict(cached_device)
+
         if is_firebase_active():
             try:
                 db = get_firestore_client()
@@ -466,9 +743,14 @@ class FirestoreService:
                     if doc.exists:
                         d = doc.to_dict()
                         d["device_id"] = doc.id
-                        return self._enrich_device_dict(d)
+                        enriched = self._enrich_device_dict(d)
+                        self._cache_device(device_id, enriched)
+                        return enriched
             except Exception as e:
                 app_logger.error(f"Firestore get_device for {device_id} failed: {e}. Falling back to SQLite.")
+                cached_device = self._cached_device(device_id, allow_expired=True)
+                if cached_device is not None:
+                    return self._enrich_device_dict(cached_device)
 
         conn = sqlite3.connect(str(LOCAL_DB))
         conn.row_factory = sqlite3.Row
@@ -477,7 +759,9 @@ class FirestoreService:
         conn.close()
         if row:
             d = dict(row)
-            return self._enrich_device_dict(d)
+            enriched = self._enrich_device_dict(d)
+            self._cache_device(device_id, enriched)
+            return enriched
         return None
 
     def update_device_wearer(self, device_id: str, wearer_name: str, case_number: str):
@@ -489,6 +773,7 @@ class FirestoreService:
         )
         conn.commit()
         conn.close()
+        self._invalidate_device_caches(device_id)
 
         if is_firebase_active():
             def _bg_sync():
@@ -504,15 +789,18 @@ class FirestoreService:
             threading.Thread(target=_bg_sync, daemon=True).start()
 
     # --- TELEMETRY ---
-    def save_telemetry(self, data: Dict[str, Any]):
+    def save_telemetry(
+        self, data: Dict[str, Any], wait_for_firestore: bool = False
+    ):
         """
         Saves GPS and sensor telemetry record into SQLite and Firebase history subcollection.
         Never overwrites valid device coordinates with invalid readings.
         """
         dev_id = str(data["device_id"])
-        lat = data.get("latitude")
-        lon = data.get("longitude")
-        is_gps_valid = bool(data.get("gps_valid", False)) and (lat is not None and lon is not None and (lat != 0.0 or lon != 0.0))
+        gps_time = normalize_iso_timestamp(data.get("timestamp"))
+        position = valid_coordinate_pair(data.get("latitude"), data.get("longitude"))
+        is_gps_valid = bool(data.get("gps_valid", False)) and position is not None and gps_time is not None
+        lat, lon = position if is_gps_valid and position is not None else (None, None)
         speed_val = data.get("speed_kmh") if data.get("speed_kmh") is not None else data.get("speed")
         bearing_val = (
             data.get("heading")
@@ -520,6 +808,9 @@ class FirestoreService:
             else (data.get("bearing") if data.get("bearing") is not None else data.get("course"))
         )
         batt_val = data.get("battery")
+        steps_val = data.get("steps")
+        gps_source = data.get("gps_source")
+        received_at = current_iso_timestamp()
 
         # 1. Local SQLite
         try:
@@ -528,36 +819,37 @@ class FirestoreService:
             cur.execute("""
                 INSERT INTO telemetry (
                     device_id, timestamp, gps_valid, latitude, longitude,
-                    speed_kmh, battery, steps, maps_url, heading, bearing, course
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    speed_kmh, battery, steps, maps_url, heading, bearing, course, gps_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 dev_id,
                 data.get("timestamp"),
                 1 if is_gps_valid else 0,
-                lat if is_gps_valid else None,
-                lon if is_gps_valid else None,
+                lat,
+                lon,
                 float(speed_val) if speed_val is not None else 0.0,
-                batt_val if batt_val is not None else 0,
-                data.get("steps", 0),
+                batt_val,
+                steps_val,
                 data.get("maps_url"),
                 float(bearing_val) if bearing_val is not None else 0.0,
                 float(bearing_val) if bearing_val is not None else 0.0,
-                float(bearing_val) if bearing_val is not None else 0.0
+                float(bearing_val) if bearing_val is not None else 0.0,
+                gps_source
             ))
             conn.commit()
             conn.close()
         except Exception as e:
             app_logger.error(f"SQLite save_telemetry error: {e}")
 
-        # 2. Async Firestore Sync
+        # 2. Firestore Sync
         if is_firebase_active():
-            def _bg_sync():
+            def _sync_firestore():
                 try:
                     db = get_firestore_client()
                     if db:
                         h = float(bearing_val or 0.0)
                         spd = float(speed_val or 0.0)
-                        ts = data.get("timestamp") or current_iso_timestamp()
+                        ts = data.get("timestamp") or received_at
 
                         telemetry_record = {
                             **data,
@@ -569,10 +861,13 @@ class FirestoreService:
                             "speed": spd,
                             "speed_kmh": spd,
                             "timestamp": ts,
+                            "received_at": received_at,
                             "gps_valid": is_gps_valid,
                             "gps_fix": is_gps_valid,
                             "gps_locked": is_gps_valid,
-                            "gps_status": "GPS Locked" if is_gps_valid else "No Fix",
+                            "gps_status": data.get(
+                                "gps_status", "GPS Locked" if is_gps_valid else "No Fix"
+                            ),
                         }
                         if batt_val is not None:
                             telemetry_record["battery"] = batt_val
@@ -583,7 +878,7 @@ class FirestoreService:
                         db.collection("devices").document(dev_id).collection("history").add(telemetry_record)
 
                         # Update parent device document
-                        gps_status_str = "GPS Locked" if is_gps_valid else "No Fix"
+                        gps_status_str = telemetry_record["gps_status"]
                         dev_update: Dict[str, Any] = {
                             "heading": h,
                             "bearing": h,
@@ -595,7 +890,7 @@ class FirestoreService:
                             "speed": spd,
                             "speed_kmh": spd,
                             "status": "ONLINE",
-                            "last_seen": ts,
+                            "last_seen": received_at,
                             "gps_valid": is_gps_valid,
                             "gps_fix": is_gps_valid,
                             "gps_locked": is_gps_valid,
@@ -607,16 +902,32 @@ class FirestoreService:
                             dev_update["battery_percent"] = batt_val
                             dev_update["battery_level"] = batt_val
                             dev_update["charge"] = batt_val
+                        if steps_val is not None:
+                            dev_update["steps"] = steps_val
+                        if data.get("is_charging") is not None or data.get("charging") is not None:
+                            charging = bool(data.get("is_charging") or data.get("charging"))
+                            dev_update["is_charging"] = charging
+                            dev_update["charging"] = charging
+                            dev_update["charge_status"] = "charging" if charging else "discharging"
 
                         # Only update coordinates on parent doc if GPS is genuinely valid
-                        if is_gps_valid and lat is not None and lon is not None:
+                        if is_gps_valid and lat is not None and lon is not None and gps_time is not None:
+                            if gps_source:
+                                dev_update["gps_source"] = gps_source
+                                dev_update["last_fix"] = {
+                                    "at": gps_time,
+                                    "lat": lat,
+                                    "lon": lon,
+                                    "gps_source": gps_source,
+                                    "gps_valid": True
+                                }
                             dev_update["last_latitude"] = lat
                             dev_update["last_longitude"] = lon
                             dev_update["lat"] = lat
                             dev_update["lon"] = lon
                             dev_update["latitude"] = lat
                             dev_update["longitude"] = lon
-                            dev_update["last_valid_gps_time"] = ts
+                            dev_update["last_valid_gps_time"] = gps_time
                             dev_update["maps_url"] = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
                             dev_update["latest"] = {
                                 "location": {
@@ -633,13 +944,14 @@ class FirestoreService:
                                     "gps_valid": True,
                                     "gps_locked": True,
                                     "gps_status": "GPS Locked",
+                                    "gps_source": gps_source,
                                     "device_id": dev_id,
-                                    "gps_time": ts,
-                                    "received_at": ts
+                                    "gps_time": gps_time,
+                                    "received_at": received_at
                                 },
                                 "status": {
                                     "device_id": dev_id,
-                                    "received_at": ts,
+                                    "received_at": received_at,
                                     "status": "ONLINE"
                                 }
                             }
@@ -647,30 +959,381 @@ class FirestoreService:
                                 dev_update["latest"]["location"]["battery_percent"] = batt_val
                                 dev_update["latest"]["status"]["battery_percent"] = batt_val
 
-                        db.collection("devices").document(dev_id).set(dev_update, merge=True)
+                        self._merge_firestore_device(
+                            db,
+                            dev_id,
+                            dev_update,
+                            event_time=received_at,
+                            location_time=gps_time,
+                            has_valid_location=is_gps_valid and gps_time is not None
+                        )
                 except Exception as e:
                     app_logger.error(f"Firestore save_telemetry sync error: {e}")
 
-            threading.Thread(target=_bg_sync, daemon=True).start()
+            if wait_for_firestore:
+                _sync_firestore()
+            else:
+                threading.Thread(target=_sync_firestore, daemon=True).start()
 
-    def get_telemetry_history(self, device_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _normalize_verified_fix(
+        device_id: str, fix: Any
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(fix, dict):
+            return None
+
+        gps_source = fix.get("gps_source") or fix.get("source")
+        is_valid = any(
+            fix.get(flag) is True
+            for flag in ("gps_valid", "gps_fix", "gps_locked")
+        )
+        position = valid_coordinate_pair(
+            fix.get("latitude", fix.get("lat")),
+            fix.get("longitude", fix.get("lon", fix.get("lng")))
+        )
+        timestamp = normalize_iso_timestamp(
+            fix.get("timestamp") or fix.get("at") or fix.get("gps_time")
+        )
+        if not gps_source or not is_valid or position is None or timestamp is None:
+            return None
+
+        latitude, longitude = position
+        return {
+            "device_id": device_id,
+            "timestamp": timestamp,
+            "gps_valid": True,
+            "gps_fix": True,
+            "gps_locked": True,
+            "gps_status": "GPS Locked",
+            "gps_source": gps_source,
+            "latitude": latitude,
+            "longitude": longitude,
+            "maps_url": f"https://maps.google.com/?q={latitude:.6f},{longitude:.6f}"
+        }
+
+    def _sync_firestore_telemetry_history(self, device_id: str, limit: int) -> None:
+        """Incrementally copies remote history into SQLite without rereading old fixes."""
+        if not is_firebase_active():
+            return
+
+        with self._firestore_history_sync_lock:
+            now = time.time()
+            conn = sqlite3.connect(str(LOCAL_DB))
+            try:
+                state = conn.execute(
+                    """
+                    SELECT watermark, watermark_kind, checked_at
+                    FROM firestore_history_sync WHERE device_id = ?
+                    """,
+                    (device_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+
+            if state and now - state[2] < 15:
+                return
+
+            watermark, watermark_kind = (state[0], state[1]) if state else (None, None)
+            try:
+                db = get_firestore_client()
+                if not db:
+                    return
+
+                history = (
+                    db.collection("devices")
+                    .document(device_id)
+                    .collection("history")
+                )
+                if watermark is None:
+                    query = history.order_by(
+                        "timestamp", direction=cloud_firestore.Query.DESCENDING
+                    ).limit(max(limit, 500))
+                else:
+                    query_value = (
+                        parse_iso_timestamp(watermark)
+                        if watermark_kind == "datetime"
+                        else watermark
+                    )
+                    query = (
+                        history.where("timestamp", ">", query_value)
+                        .order_by("timestamp", direction=cloud_firestore.Query.ASCENDING)
+                        .limit(500)
+                    )
+
+                snapshots = list(query.stream(timeout=2.0))
+                records = []
+                for snapshot in snapshots:
+                    record = snapshot.to_dict() or {}
+                    raw_timestamp = record.get("timestamp")
+                    timestamp = normalize_iso_timestamp(raw_timestamp)
+                    position = valid_coordinate_pair(
+                        record.get("latitude", record.get("lat")),
+                        record.get("longitude", record.get("lon", record.get("lng")))
+                    )
+                    is_valid = (
+                        bool(record.get("gps_valid", record.get("gps_fix", False)))
+                        and position is not None
+                        and timestamp is not None
+                    )
+                    latitude, longitude = position if is_valid and position else (None, None)
+                    records.append((
+                        record.get("device_id") or device_id,
+                        timestamp,
+                        1 if is_valid else 0,
+                        latitude,
+                        longitude,
+                        float(record.get("speed_kmh") or record.get("speed") or 0.0),
+                        record.get("battery"),
+                        record.get("steps"),
+                        record.get("maps_url"),
+                        float(record.get("heading") or record.get("bearing") or 0.0),
+                        float(record.get("bearing") or record.get("heading") or 0.0),
+                        float(record.get("course") or record.get("heading") or 0.0),
+                        int(bool(record.get("is_charging") or record.get("charging"))),
+                        int(bool(record.get("charging") or record.get("is_charging"))),
+                        record.get("gps_source") or record.get("source"),
+                        snapshot.id
+                    ))
+
+                device_snapshot = db.collection("devices").document(device_id).get(timeout=2.0)
+                device_data = {}
+                if device_snapshot.exists:
+                    device_data = device_snapshot.to_dict() or {}
+                latest = device_data.get("latest")
+                latest_location = latest.get("location") if isinstance(latest, dict) else None
+                for snapshot_name, candidate in (
+                    ("last_fix", device_data.get("last_fix")),
+                    ("latest", latest_location)
+                ):
+                    verified_fix = self._normalize_verified_fix(device_id, candidate)
+                    if verified_fix is not None:
+                        position = (verified_fix["latitude"], verified_fix["longitude"])
+                        records.append((
+                            device_id,
+                            verified_fix["timestamp"],
+                            1,
+                            position[0],
+                            position[1],
+                            float(candidate.get("speed_kmh") or candidate.get("speed") or 0.0),
+                            candidate.get("battery"),
+                            candidate.get("steps"),
+                            verified_fix["maps_url"],
+                            float(candidate.get("heading") or candidate.get("bearing") or 0.0),
+                            float(candidate.get("bearing") or candidate.get("heading") or 0.0),
+                            float(candidate.get("course") or candidate.get("heading") or 0.0),
+                            int(bool(candidate.get("is_charging") or candidate.get("charging"))),
+                            int(bool(candidate.get("charging") or candidate.get("is_charging"))),
+                            verified_fix["gps_source"],
+                            f"snapshot:{snapshot_name}:{verified_fix['timestamp']}"
+                        ))
+
+                conn = sqlite3.connect(str(LOCAL_DB))
+                try:
+                    conn.executemany(
+                        """
+                        INSERT OR IGNORE INTO telemetry (
+                            device_id, timestamp, gps_valid, latitude, longitude,
+                            speed_kmh, battery, steps, maps_url, heading, bearing, course,
+                            is_charging, charging, gps_source, firestore_document_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        records
+                    )
+
+                    if snapshots:
+                        watermark_snapshot = snapshots[0] if watermark is None else snapshots[-1]
+                        raw_timestamp = (watermark_snapshot.to_dict() or {}).get("timestamp")
+                        next_kind = "datetime" if isinstance(raw_timestamp, datetime) else "string"
+                        next_watermark = (
+                            normalize_iso_timestamp(raw_timestamp)
+                            if next_kind == "datetime"
+                            else str(raw_timestamp)
+                        )
+                    else:
+                        next_watermark = watermark
+                        next_kind = watermark_kind
+
+                    conn.execute(
+                        """
+                        INSERT INTO firestore_history_sync (
+                            device_id, watermark, watermark_kind, checked_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(device_id) DO UPDATE SET
+                            watermark = excluded.watermark,
+                            watermark_kind = excluded.watermark_kind,
+                            checked_at = excluded.checked_at
+                        """,
+                        (device_id, next_watermark, next_kind, now)
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as e:
+                app_logger.error(
+                    f"Firestore telemetry history sync failed for {device_id}: {e}"
+                )
+                conn = sqlite3.connect(str(LOCAL_DB))
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO firestore_history_sync (device_id, checked_at)
+                        VALUES (?, ?)
+                        ON CONFLICT(device_id) DO UPDATE SET checked_at = excluded.checked_at
+                        """,
+                        (device_id, now)
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+    def get_latest_valid_telemetry(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """Returns the newest valid local GPS fix by event time."""
         conn = sqlite3.connect(str(LOCAL_DB))
         conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute(
-            "SELECT * FROM telemetry WHERE device_id = ? ORDER BY id DESC LIMIT ?",
-            (device_id, limit)
-        ).fetchall()
-        conn.close()
-        formatted = []
-        for r in rows:
-            d = dict(r)
-            d.setdefault("heading", d.get("heading", 0.0))
-            d.setdefault("bearing", d.get("heading", 0.0))
-            d.setdefault("direction_deg", d.get("heading", 0.0))
-            d.setdefault("speed", d.get("speed_kmh", 0.0))
-            formatted.append(d)
-        return formatted
+        try:
+            row = conn.execute(
+                """
+                SELECT * FROM telemetry
+                WHERE device_id = ?
+                  AND gps_valid = 1
+                  AND latitude BETWEEN -90 AND 90
+                  AND longitude BETWEEN -180 AND 180
+                  AND NOT (latitude = 0 AND longitude = 0)
+                  AND julianday(timestamp) IS NOT NULL
+                ORDER BY julianday(timestamp) DESC, id DESC
+                LIMIT 1
+                """,
+                (device_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_latest_valid_location(
+        self,
+        device_id: str,
+        device_data: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Chooses the newest valid location from the device snapshot and SQLite history."""
+        device_data = device_data or {}
+        device_lat = device_data.get("last_latitude")
+        if device_lat is None:
+            device_lat = device_data.get("latitude")
+        device_lon = device_data.get("last_longitude")
+        if device_lon is None:
+            device_lon = device_data.get("longitude")
+        device_coords = valid_coordinate_pair(device_lat, device_lon)
+        device_time = device_data.get("last_valid_gps_time")
+        location: Optional[Dict[str, Any]] = None
+        if device_coords is not None:
+            location = {
+                "latitude": device_coords[0],
+                "longitude": device_coords[1],
+                "timestamp": device_time,
+                "maps_url": device_data.get("maps_url"),
+                "gps_source": device_data.get("gps_source"),
+                "is_newer": False
+            }
+
+        latest = device_data.get("latest")
+        latest_location = latest.get("location") if isinstance(latest, dict) else None
+        for candidate in (device_data.get("last_fix"), latest_location):
+            verified_fix = self._normalize_verified_fix(device_id, candidate)
+            if verified_fix is None:
+                continue
+            if location is None or is_newer_timestamp(
+                verified_fix["timestamp"], location.get("timestamp")
+            ):
+                location = {
+                    **verified_fix,
+                    "is_newer": True
+                }
+
+        telemetry = self.get_latest_valid_telemetry(device_id)
+        telemetry_time = telemetry.get("timestamp") if telemetry else None
+        telemetry_matches_current_time = (
+            telemetry is not None
+            and parse_iso_timestamp(telemetry_time) is not None
+            and parse_iso_timestamp(telemetry_time) == parse_iso_timestamp(
+                location.get("timestamp") if location else None
+            )
+        )
+        if telemetry and (
+            location is None
+            or is_newer_timestamp(telemetry_time, location.get("timestamp"))
+            or (
+                telemetry_matches_current_time
+                and not location.get("gps_source")
+                and bool(telemetry.get("gps_source"))
+            )
+        ):
+            location = {
+                "latitude": telemetry["latitude"],
+                "longitude": telemetry["longitude"],
+                "timestamp": telemetry_time,
+                "maps_url": telemetry.get("maps_url"),
+                "gps_source": telemetry.get("gps_source"),
+                "is_newer": True
+            }
+
+        if location is not None:
+            fix_time = parse_iso_timestamp(location.get("timestamp"))
+            is_stale = (
+                fix_time is not None
+                and (datetime.now(timezone.utc) - fix_time).total_seconds() > 900
+            )
+            location["gps_status"] = "Location Stale" if is_stale else "GPS Locked"
+            location["gps_valid"] = not is_stale
+            location["gps_fix"] = not is_stale
+            location["gps_locked"] = not is_stale
+        return location
+
+    def get_telemetry_history(self, device_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        self._sync_firestore_telemetry_history(device_id, limit)
+        conn = sqlite3.connect(str(LOCAL_DB))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM telemetry
+                WHERE device_id = ?
+                ORDER BY julianday(timestamp) DESC, id DESC
+                LIMIT ?
+                """,
+                (device_id, limit)
+            ).fetchall()
+            records = [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+        unique_records = []
+        seen = set()
+        for record in records:
+            timestamp = normalize_iso_timestamp(record.get("timestamp"))
+            position = valid_coordinate_pair(
+                record.get("latitude", record.get("lat")),
+                record.get("longitude", record.get("lon", record.get("lng")))
+            )
+            key = (
+                timestamp,
+                bool(record.get("gps_valid", record.get("gps_fix", False))),
+                position
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            record.setdefault("heading", record.get("bearing", 0.0))
+            record.setdefault("bearing", record.get("heading", 0.0))
+            record.setdefault("direction_deg", record.get("heading", 0.0))
+            record.setdefault("speed", record.get("speed_kmh", 0.0))
+            unique_records.append(record)
+
+        unique_records.sort(
+            key=lambda record: parse_iso_timestamp(record.get("timestamp"))
+            or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True
+        )
+        return unique_records[:limit]
 
     # --- ALERTS ---
     def save_alert(self, alert_data: Dict[str, Any]):
@@ -854,13 +1517,13 @@ class FirestoreService:
                 d["route_coordinates"] = json.loads(d.get("route_coordinates_json") or "[]")
             except Exception:
                 d["route_coordinates"] = []
-            if d.get("start_latitude") and d.get("start_longitude"):
+            if d.get("start_latitude") is not None and d.get("start_longitude") is not None:
                 d["start_location"] = {
                     "latitude": d["start_latitude"],
                     "longitude": d["start_longitude"],
                     "timestamp": d.get("start_time")
                 }
-            if d.get("end_latitude") and d.get("end_longitude"):
+            if d.get("end_latitude") is not None and d.get("end_longitude") is not None:
                 d["end_location"] = {
                     "latitude": d["end_latitude"],
                     "longitude": d["end_longitude"],
@@ -904,13 +1567,13 @@ class FirestoreService:
                 d["route_coordinates"] = json.loads(d.get("route_coordinates_json") or "[]")
             except Exception:
                 d["route_coordinates"] = []
-            if d.get("start_latitude") and d.get("start_longitude"):
+            if d.get("start_latitude") is not None and d.get("start_longitude") is not None:
                 d["start_location"] = {
                     "latitude": d["start_latitude"],
                     "longitude": d["start_longitude"],
                     "timestamp": d.get("start_time")
                 }
-            if d.get("end_latitude") and d.get("end_longitude"):
+            if d.get("end_latitude") is not None and d.get("end_longitude") is not None:
                 d["end_location"] = {
                     "latitude": d["end_latitude"],
                     "longitude": d["end_longitude"],
@@ -944,13 +1607,13 @@ class FirestoreService:
                 d["route_coordinates"] = json.loads(d.get("route_coordinates_json") or "[]")
             except Exception:
                 d["route_coordinates"] = []
-            if d.get("start_latitude") and d.get("start_longitude"):
+            if d.get("start_latitude") is not None and d.get("start_longitude") is not None:
                 d["start_location"] = {
                     "latitude": d["start_latitude"],
                     "longitude": d["start_longitude"],
                     "timestamp": d.get("start_time")
                 }
-            if d.get("end_latitude") and d.get("end_longitude"):
+            if d.get("end_latitude") is not None and d.get("end_longitude") is not None:
                 d["end_location"] = {
                     "latitude": d["end_latitude"],
                     "longitude": d["end_longitude"],

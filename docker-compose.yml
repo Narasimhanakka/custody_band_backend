@@ -37,7 +37,7 @@ services:
       - TCP_HOST=0.0.0.0
       - TCP_PORT=9001
       - PUBLIC_SERVER_IP=103.44.0.5
-      - FIREBASE_PROJECT_ID=update-custody-band-back-1c169
+      - FIREBASE_PROJECT_ID=custody-band-a8f59
       - FIREBASE_CREDENTIALS_PATH=/app/secrets/firebase_service_account.json
       - ADMIN_EMAIL=awsdevopskumar2026@gmail.com
       - ADMIN_NAME=aditya

@@ -12,10 +12,14 @@ Validates all 8 testing requirements specified by the task:
 8. Keepalive (KA/LK) packets correctly update device telemetry
 """
 
+import importlib
 import sys
+import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from unittest.mock import patch, MagicMock
 
 # Ensure backend root is on sys.path
@@ -26,14 +30,28 @@ if str(BASE_DIR) not in sys.path:
 from app.receiver.packet_parser import parse_ud, parse_packet
 from app.services.device_service import device_service
 from app.services.firestore_service import firestore_service
-from app.services.gps_service import gps_service
 from app.dashboard.dashboard_service import dashboard_service
+
+firestore_module = importlib.import_module("app.services.firestore_service")
 
 
 class TestGPSAndFirebaseSync(unittest.TestCase):
     def setUp(self):
-        self.dev_id = "TEST_DEVICE_8637580"
+        self.dev_id = f"TEST_DEVICE_{uuid.uuid4().hex[:8]}"
         self.maker = "MNYD"
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_patcher = patch.object(
+            firestore_module, "LOCAL_DB", Path(self.temp_dir.name) / "gps-sync-test.db"
+        )
+        self.db_patcher.start()
+        firestore_service._init_local_db()
+        with firestore_service._device_cache_lock:
+            firestore_service._device_cache.clear()
+            firestore_service._devices_cache = None
+        self.firebase_patcher = patch.object(
+            firestore_module, "is_firebase_active", return_value=False
+        )
+        self.firebase_patcher.start()
 
         # Mock Firestore client to capture writes and allow fast, reliable unit testing
         self.mock_db = MagicMock()
@@ -48,7 +66,8 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         mock_doc = MagicMock()
         mock_doc.set.side_effect = mock_set
 
-        def mock_get(timeout=None):
+        def mock_get(timeout=None, transaction=None):
+            _ = transaction
             m = MagicMock()
             if self.dev_id in self.saved_docs:
                 m.exists = True
@@ -78,10 +97,44 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
 
     def tearDown(self):
         self.firestore_patcher.stop()
+        self.firebase_patcher.stop()
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _watch_packet(
+        timestamp: datetime,
+        status: str,
+        latitude: float,
+        longitude: float,
+        battery: Optional[int] = None,
+        satellites: int = 0,
+    ) -> bytes:
+        fields = [
+            "UD",
+            timestamp.strftime("%y%m%d"),
+            timestamp.strftime("%H%M%S"),
+            status,
+            f"{latitude:.6f}",
+            "N",
+            f"{longitude:.6f}",
+            "E",
+            "16.5",
+            "142.0",
+            "510.0",
+            str(satellites),
+            "95",
+            str(battery) if battery is not None else "",
+            "1250",
+            "00000000",
+        ]
+        return ",".join(fields).encode("latin-1")
 
     def test_01_valid_ud_packet_status_a(self):
         """Test 1: Valid UD packet with status 'A' produces GPS Locked fix and valid coordinates."""
-        content = b"UD,261106,110000,A,17.445000,N,78.370000,E,16.5,142.0,510.0,8,95,73,1250,00000000,0,0,0,0,0"
+        content = self._watch_packet(
+            datetime.now(timezone.utc), "A", 17.445, 78.37, battery=73, satellites=0
+        )
         rec = parse_ud(content, self.dev_id, self.maker)
 
         self.assertIsNotNone(rec)
@@ -89,6 +142,7 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         self.assertTrue(rec["gps_fix"])
         self.assertTrue(rec["gps_locked"])
         self.assertEqual(rec["gps_status"], "GPS Locked")
+        self.assertEqual(rec["gps_source"], "watch_tcp")
         self.assertEqual(rec["latitude"], 17.445000)
         self.assertEqual(rec["longitude"], 78.370000)
         self.assertEqual(rec["battery"], 73)
@@ -97,7 +151,9 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
 
     def test_02_invalid_ud_packet_status_v(self):
         """Test 2: Invalid UD packet with status 'V' produces No Fix and null fix coordinates."""
-        content = b"UD,261106,110100,V,0.000000,N,0.000000,E,0.0,0.0,0.0,0,40,65,1260,00000000,0,0,0,0,0"
+        content = self._watch_packet(
+            datetime.now(timezone.utc), "V", 0.0, 0.0, battery=65, satellites=0
+        )
         rec = parse_ud(content, self.dev_id, self.maker)
 
         self.assertIsNotNone(rec)
@@ -105,6 +161,7 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         self.assertFalse(rec["gps_fix"])
         self.assertFalse(rec["gps_locked"])
         self.assertEqual(rec["gps_status"], "No Fix")
+        self.assertIsNone(rec["gps_source"])
         self.assertIsNone(rec["latitude"])
         self.assertIsNone(rec["longitude"])
         self.assertEqual(rec["battery"], 65)
@@ -112,7 +169,10 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
     def test_03_invalid_gps_does_not_overwrite_previous_valid_coordinates(self):
         """Test 3: Status 'V' does not clobber previously stored valid GPS coordinates."""
         # 1. Establish valid fix
-        valid_content = b"UD,261106,110500,A,17.446317,N,78.368395,E,14.0,90.0,500.0,9,100,88,1400,00000000,0,0,0,0,0"
+        valid_time = datetime.now(timezone.utc)
+        valid_content = self._watch_packet(
+            valid_time, "A", 17.446317, 78.368395, battery=88, satellites=0
+        )
         parse_ud(valid_content, self.dev_id, self.maker)
 
         dev_after_valid = device_service.get_device_by_id(self.dev_id)
@@ -121,7 +181,9 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
         self.assertEqual(dev_after_valid["gps_status"], "GPS Locked")
 
         # 2. Receive invalid fix ('V' with 0,0)
-        invalid_content = b"UD,261106,110600,V,0.000000,N,0.000000,E,0.0,0.0,0.0,0,30,85,1420,00000000,0,0,0,0,0"
+        invalid_content = self._watch_packet(
+            valid_time + timedelta(seconds=1), "V", 0.0, 0.0, battery=85, satellites=0
+        )
         parse_ud(invalid_content, self.dev_id, self.maker)
 
         dev_after_invalid = device_service.get_device_by_id(self.dev_id)
@@ -134,7 +196,9 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
 
     def test_04_battery_updates_even_when_gps_invalid(self):
         """Test 4: Battery updates to real reading even when GPS status is 'V'."""
-        invalid_content = b"UD,261106,110700,V,0.000000,N,0.000000,E,0.0,0.0,0.0,0,30,42,1430,00000000,0,0,0,0,0"
+        invalid_content = self._watch_packet(
+            datetime.now(timezone.utc), "V", 0.0, 0.0, battery=42, satellites=0
+        )
         parse_ud(invalid_content, self.dev_id, self.maker)
 
         dev = device_service.get_device_by_id(self.dev_id)
@@ -144,8 +208,15 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
 
     def test_05_firebase_shows_actual_battery_no_defaults(self):
         """Test 5: Actual battery reading is preserved; never replaced with 90 or 100."""
-        for test_batt in (15, 37, 77, 8):
-            content = f"UD,261106,110800,A,17.445500,N,78.369000,E,10.0,45.0,500.0,7,80,{test_batt},1500,00000000,0,0,0,0,0".encode("latin-1")
+        for index, test_batt in enumerate((15, 37, 77, 8)):
+            content = self._watch_packet(
+                datetime.now(timezone.utc) + timedelta(seconds=index),
+                "A",
+                17.4455,
+                78.369,
+                battery=test_batt,
+                satellites=0,
+            )
             parse_ud(content, self.dev_id, self.maker)
             dev = device_service.get_device_by_id(self.dev_id)
             self.assertEqual(dev["battery"], test_batt, f"Battery should be {test_batt}, not defaulted to 90")
@@ -184,30 +255,24 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
 
         # 3. Simulate stale fix (> 15 minutes ago)
         old_time = (datetime.now(timezone.utc) - timedelta(minutes=25)).isoformat()
+        stale_device_id = f"{self.dev_id}_STALE_{uuid.uuid4().hex}"
         device_service.update_position(
-            device_id=self.dev_id,
-            lat=None,
-            lon=None,
+            device_id=stale_device_id,
+            lat=17.447000,
+            lon=78.369500,
             battery=78,
             steps=1020,
-            gps_valid=False,
+            gps_valid=True,
             timestamp=old_time
         )
-        # Force stale timestamp on last_valid_gps_time to test staleness logic
-        firestore_service.save_device({
-            "device_id": self.dev_id,
-            "last_valid_gps_time": old_time,
-            "last_latitude": 17.447000,
-            "last_longitude": 78.369500,
-            "gps_valid": False,
-            "gps_status": "Location Stale"
-        })
-        dev = device_service.get_device_by_id(self.dev_id)
+        dev = device_service.get_device_by_id(stale_device_id)
         self.assertEqual(dev["gps_status"], "Location Stale")
 
     def test_07_frontend_map_displays_actual_valid_device_coordinates(self):
         """Test 7: Dashboard markers and devices list display real coordinates without mock fallbacks."""
-        content = b"UD,261106,111000,A,17.448123,N,78.371456,E,18.0,200.0,520.0,9,95,68,2500,00000000,0,0,0,0,0"
+        content = self._watch_packet(
+            datetime.now(timezone.utc), "A", 17.448123, 78.371456, battery=68, satellites=0
+        )
         parse_ud(content, self.dev_id, self.maker)
 
         summary = dashboard_service.get_summary_stats()

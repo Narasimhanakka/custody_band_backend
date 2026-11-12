@@ -3,6 +3,7 @@ Custody Management Routes
 Endpoints for monitoring wearers under custody, device telemetry, and profile management.
 """
 
+import math
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status, Query, Request
 from ..services.device_service import device_service
@@ -17,12 +18,38 @@ def _format_custody_record(dev: Dict[str, Any]) -> Dict[str, Any]:
     dev_id = str(dev.get("device_id") or dev.get("imei") or "")
     wearer = dev.get("wearer_name") or dev.get("name") or "Wearer"
     case_num = dev.get("case_number") or f"CASE-{dev_id[-4:] if len(dev_id) >= 4 else '001'}"
-    lat = dev.get("last_latitude") or dev.get("latitude") or 17.446317
-    lon = dev.get("last_longitude") or dev.get("longitude") or 78.368395
+
+    lat = dev.get("last_latitude")
+    if lat is None:
+        lat = dev.get("latitude")
+    lon = dev.get("last_longitude")
+    if lon is None:
+        lon = dev.get("longitude")
+
+    try:
+        lat = float(lat) if lat is not None else None
+        lon = float(lon) if lon is not None else None
+        if (
+            lat is None
+            or lon is None
+            or not math.isfinite(lat)
+            or not math.isfinite(lon)
+            or not -90 <= lat <= 90
+            or not -180 <= lon <= 180
+            or (lat == 0.0 and lon == 0.0)
+        ):
+            lat = lon = None
+    except (TypeError, ValueError):
+        lat = lon = None
+
     battery = dev.get("battery", 94)
     steps = dev.get("steps", 0)
     dev_status = dev.get("status", "ACTIVE")
+    gps_valid = bool(dev.get("gps_valid", False)) and lat is not None and lon is not None
     is_online = dev_status.upper() in ("ONLINE", "ACTIVE")
+    maps_url = None
+    if lat is not None and lon is not None:
+        maps_url = dev.get("maps_url") or f"https://maps.google.com/?q={lat},{lon}"
 
     return {
         "id": dev_id,
@@ -43,7 +70,10 @@ def _format_custody_record(dev: Dict[str, Any]) -> Dict[str, Any]:
         "longitude": lon,
         "last_latitude": lat,
         "last_longitude": lon,
-        "maps_url": dev.get("maps_url") or f"https://maps.google.com/?q={lat},{lon}",
+        "maps_url": maps_url,
+        "gps_valid": gps_valid,
+        "gps_status": dev.get("gps_status", "No Fix"),
+        "last_valid_gps_time": dev.get("last_valid_gps_time"),
         "last_seen": dev.get("last_seen") or current_iso_timestamp(),
         "created_at": dev.get("created_at") or current_iso_timestamp(),
         "updated_at": dev.get("updated_at") or current_iso_timestamp(),
@@ -178,4 +208,3 @@ async def send_custody_command(custody_id: str, request: Request):
         "dispatched": sent,
         "message": f"Command '{command}' sent to custody band" if sent else "Watch is sleeping or offline"
     }
-

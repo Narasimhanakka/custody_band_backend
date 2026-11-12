@@ -8,7 +8,13 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 from ..utils.datetime_utils import current_iso_timestamp
 from ..utils.logger import app_logger
-from .firestore_service import firestore_service
+from .firestore_service import (
+    firestore_service,
+    is_newer_timestamp,
+    normalize_iso_timestamp,
+    parse_iso_timestamp,
+    valid_coordinate_pair
+)
 
 
 class DeviceService:
@@ -122,7 +128,8 @@ class DeviceService:
         gps_valid: bool = False,
         satellites: int = 0,
         gsm_signal: int = 0,
-        timestamp: Optional[str] = None
+        timestamp: Optional[str] = None,
+        gps_source: Optional[str] = None
     ):
         """
         Updates device live position and telemetry.
@@ -130,36 +137,47 @@ class DeviceService:
         while updating GPS status to 'No Fix' or 'Location Stale'.
         """
         existing = firestore_service.get_device(device_id) or {}
-        now_iso = timestamp or current_iso_timestamp()
+        received_at = current_iso_timestamp()
+        gps_time = normalize_iso_timestamp(timestamp) if timestamp is not None else received_at
+        last_lat = existing.get("last_latitude")
+        last_lon = existing.get("last_longitude")
+        last_gps_time = normalize_iso_timestamp(existing.get("last_valid_gps_time"))
+        position = valid_coordinate_pair(lat, lon)
+        new_valid_fix = (
+            gps_valid
+            and position is not None
+            and gps_time is not None
+            and is_newer_timestamp(gps_time, last_gps_time)
+        )
 
-        # Resolve GPS coordinates & status
-        if gps_valid and lat is not None and lon is not None:
-            # Valid 3D satellite fix
-            last_lat = lat
-            last_lon = lon
-            last_gps_time = now_iso
+        if new_valid_fix and position is not None:
+            last_lat, last_lon = position
+            last_gps_time = gps_time
             gps_status = "GPS Locked"
             is_fix = True
         else:
-            # Invalid fix (status 'V' or no coords) - PRESERVE PREVIOUS VALID COORDINATES
-            last_lat = existing.get("last_latitude")
-            last_lon = existing.get("last_longitude")
-            last_gps_time = existing.get("last_valid_gps_time")
-            is_fix = False
+            last_fix = parse_iso_timestamp(last_gps_time)
+            is_stale = (
+                last_fix is not None
+                and (datetime.now(timezone.utc) - last_fix).total_seconds() > 900
+            )
+            previous_fix_is_newer = (
+                last_fix is not None
+                and parse_iso_timestamp(gps_time) is not None
+                and parse_iso_timestamp(gps_time) < last_fix
+            )
 
-            # Determine whether location is stale (> 15 minutes old) or simply No Fix
-            if last_gps_time:
-                try:
-                    dt_fix = datetime.fromisoformat(last_gps_time.replace("Z", "+00:00"))
-                    now_dt = datetime.now(timezone.utc)
-                    if (now_dt - dt_fix).total_seconds() > 900:  # 15 minutes
-                        gps_status = "Location Stale"
-                    else:
-                        gps_status = "No Fix"
-                except Exception:
-                    gps_status = "No Fix"
+            if previous_fix_is_newer:
+                # Delayed packets must not change the state of a newer accepted fix.
+                prior_status = existing.get("gps_status")
+                is_fix = bool(existing.get("gps_valid")) and not is_stale
+                gps_status = (
+                    "Location Stale" if is_stale
+                    else ("GPS Locked" if is_fix else prior_status or "No Fix")
+                )
             else:
-                gps_status = "No Fix"
+                is_fix = False
+                gps_status = "Location Stale" if is_stale else "No Fix"
 
         # Resolve battery: actual reading if given, else preserve existing; NEVER default to 90
         dev_battery = battery if battery is not None else existing.get("battery")
@@ -172,7 +190,7 @@ class DeviceService:
 
         update_data: Dict[str, Any] = {
             "device_id": device_id,
-            "last_seen": now_iso,
+            "last_seen": received_at,
             "status": "ONLINE",
             "gps_valid": is_fix,
             "gps_fix": is_fix,
@@ -201,6 +219,8 @@ class DeviceService:
             update_data["maps_url"] = f"https://maps.google.com/?q={last_lat:.6f},{last_lon:.6f}"
         if last_gps_time:
             update_data["last_valid_gps_time"] = last_gps_time
+        if new_valid_fix and gps_source:
+            update_data["gps_source"] = gps_source
 
         if dev_battery is not None:
             update_data["battery"] = dev_battery

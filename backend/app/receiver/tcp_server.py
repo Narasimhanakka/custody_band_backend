@@ -6,7 +6,9 @@ Binds to 0.0.0.0:9001 to accept traffic arriving from 103.44.0.5:9001.
 import socket
 import threading
 import time
-from typing import Dict, Any, Optional
+import os
+import traceback
+from typing import Dict, Optional
 from ..config import settings
 from ..utils.logger import tcp_logger
 from .packet_validator import extract_frames
@@ -15,6 +17,14 @@ from .packet_parser import parse_packet, build_frame
 active_connections: Dict[str, socket.socket] = {}
 conn_lock = threading.Lock()
 _receiver_started = False
+_DIAGNOSTICS_ENABLED = os.getenv("GPS_RECEIVER_DIAGNOSTICS", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+
+def _log_diagnostic(message: str, *args):
+    if _DIAGNOSTICS_ENABLED:
+        tcp_logger.info(message, *args)
 
 
 def register_client(dev_id: str, conn: socket.socket):
@@ -64,14 +74,30 @@ def handle_tcp_client(conn: socket.socket, addr):
             if not data:
                 break
 
+            _log_diagnostic("TCP received %d bytes from %s", len(data), client_str)
             buffer += data
             frames, buffer = extract_frames(buffer)
+            _log_diagnostic("TCP extracted %d complete frame(s) from %s", len(frames), client_str)
 
             for maker, dev_id, content in frames:
                 assigned_device_id = dev_id
                 register_client(dev_id, conn)
 
-                cmd_type, reply_bytes = parse_packet(maker, dev_id, content)
+                try:
+                    cmd_type, reply_bytes = parse_packet(maker, dev_id, content)
+                except Exception as exc:
+                    tcp_logger.error(
+                        "TCP packet parsing failed for device %s exception_type=%s stack=%s",
+                        dev_id,
+                        type(exc).__name__,
+                        "".join(traceback.format_tb(exc.__traceback__))
+                    )
+                    raise
+                _log_diagnostic(
+                    "TCP parsed frame device=%s command=%s",
+                    dev_id,
+                    cmd_type or "UNKNOWN"
+                )
 
                 # Send mandatory protocol reply
                 if reply_bytes:
@@ -95,13 +121,18 @@ def handle_tcp_client(conn: socket.socket, addr):
 
     except socket.timeout:
         tcp_logger.info(f"TCP connection {client_str} timed out (device sleeping)")
-    except Exception as e:
-        tcp_logger.error(f"TCP connection {client_str} error: {e}")
+    except Exception as exc:
+        tcp_logger.error(
+            "TCP connection %s error exception_type=%s stack=%s",
+            client_str,
+            type(exc).__name__,
+            "".join(traceback.format_tb(exc.__traceback__))
+        )
     finally:
         if assigned_device_id:
             unregister_client(assigned_device_id)
         conn.close()
-        tcp_logger.info(f"TCP connection {client_str} closed")
+        tcp_logger.info(f"TCP client disconnected: {client_str}")
 
 
 _tcp_server_sock: Optional[socket.socket] = None
@@ -138,9 +169,25 @@ def run_udp_server():
         while True:
             try:
                 data, addr = udp_sock.recvfrom(4096)
+                _log_diagnostic("UDP received %d bytes", len(data))
                 frames, _ = extract_frames(data)
+                _log_diagnostic("UDP extracted %d complete frame(s)", len(frames))
                 for maker, dev_id, content in frames:
-                    cmd_type, reply_bytes = parse_packet(maker, dev_id, content)
+                    try:
+                        cmd_type, reply_bytes = parse_packet(maker, dev_id, content)
+                    except Exception as exc:
+                        tcp_logger.error(
+                            "UDP packet parsing failed for device %s exception_type=%s stack=%s",
+                            dev_id,
+                            type(exc).__name__,
+                            "".join(traceback.format_tb(exc.__traceback__))
+                        )
+                        raise
+                    _log_diagnostic(
+                        "UDP parsed frame device=%s command=%s",
+                        dev_id,
+                        cmd_type or "UNKNOWN"
+                    )
                     if reply_bytes:
                         udp_sock.sendto(reply_bytes, addr)
             except OSError:
@@ -150,8 +197,12 @@ def run_udp_server():
             tcp_logger.info(f"UDP port {settings.TCP_PORT} is shared or reserved. Running on primary TCP listener.")
         else:
             tcp_logger.info(f"UDP Server notice: {e}")
-    except Exception as e:
-        tcp_logger.info(f"UDP Server notice: {e}")
+    except Exception as exc:
+        tcp_logger.error(
+            "UDP server error exception_type=%s stack=%s",
+            type(exc).__name__,
+            "".join(traceback.format_tb(exc.__traceback__))
+        )
 
 
 def stop_receiver():
@@ -184,4 +235,3 @@ def start_receiver_background():
 
     t_udp = threading.Thread(target=run_udp_server, daemon=True, name="UDPReceiverThread")
     t_udp.start()
-

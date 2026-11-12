@@ -10,6 +10,7 @@ Verifies:
 """
 
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
 from app.services.journey_service import journey_service, format_duration
 from app.services.gps_service import gps_service
@@ -52,14 +53,15 @@ class TestJourneyTracking(unittest.TestCase):
         journey_service._active_journeys.clear()
 
         # Seed initial device fix in local storage
+        self.valid_gps_timestamp = datetime.now(timezone.utc).isoformat()
         firestore_service.save_device({
             "device_id": self.device_id,
             "last_latitude": 17.446317,
             "last_longitude": 78.368395,
             "gps_valid": True,
             "status": "ONLINE",
-            "last_seen": "2026-11-06T10:00:00Z",
-            "last_valid_gps_time": "2026-11-06T10:00:00Z"
+            "last_seen": self.valid_gps_timestamp,
+            "last_valid_gps_time": self.valid_gps_timestamp
         })
 
     def tearDown(self):
@@ -177,7 +179,7 @@ class TestJourneyTracking(unittest.TestCase):
             "last_latitude": 17.450000,
             "last_longitude": 78.380000,
             "gps_valid": True,
-            "last_valid_gps_time": "2026-11-06T11:00:00Z"
+            "last_valid_gps_time": datetime.now(timezone.utc).isoformat()
         })
         j2 = journey_service.start_journey(self.device_id)
         self.assertEqual(j2["total_distance_km"], 0.0)  # Starts at 0.0
