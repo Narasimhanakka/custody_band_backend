@@ -16,6 +16,8 @@ LOCAL_DB = BASE_DIR / "custody_watch.db"
 class CommandService:
     SUPPORTED_COMMANDS = {
         "CR": "Poll immediate live GPS coordinates",
+        "Time": "Synchronize watch time using the manufacturer Time command",
+        "LGZONE": "Configure the watch local GPS zone",
         "RESET": "Reboot watch operating system",
         "POWEROFF": "Remotely power off the custody watch",
         "FACTORY": "Reset firmware settings to factory default",
@@ -53,10 +55,14 @@ class CommandService:
     ) -> Dict[str, Any]:
         """Constructs protocol command and transmits over raw TCP socket."""
         cmd_type = command_type.strip().upper()
+        wire_command_type = {
+            "TIME": "Time",
+            "LGZONE": "LGZONE",
+        }.get(cmd_type, cmd_type)
         if parameters:
-            raw_command = f"{cmd_type},{parameters}"
+            raw_command = f"{wire_command_type},{parameters}"
         else:
-            raw_command = cmd_type
+            raw_command = wire_command_type
 
         # Send via TCP receiver
         delivered = send_command_to_device(device_id, raw_command)

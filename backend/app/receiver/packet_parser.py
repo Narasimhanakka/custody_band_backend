@@ -18,7 +18,7 @@ REPLIES = {
     "PING": "PING,1",
     "KA": "KA",
     "LK": "LK",
-    "heart": "heart",
+    "HEART": "heart",
     "AL": "AL",
 }
 _DIAGNOSTICS_ENABLED = os.getenv("GPS_RECEIVER_DIAGNOSTICS", "").strip().lower() in {
@@ -49,11 +49,18 @@ def _parse_watch_gps_timestamp(date_value: str, time_value: str) -> Optional[str
     return timestamp.isoformat()
 
 
+def _received_at_iso(received_at: Optional[float]) -> str:
+    if received_at is None:
+        return datetime.now(timezone.utc).isoformat()
+    return datetime.fromtimestamp(received_at, tz=timezone.utc).isoformat()
+
+
 def parse_ud(
     content: bytes,
     device_id: str,
     maker: str,
-    gps_source: Optional[str] = None
+    gps_source: Optional[str] = None,
+    received_at: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Parses Huaten UD / CRUD / AL packets:
@@ -113,11 +120,21 @@ def parse_ud(
             lat,
             lon,
             gps_timestamp,
-            gps_source
+            gps_source,
+            max_age_seconds=None
         )
         is_valid_gps = verified_fix is not None
+        current_fix = normalize_verified_gps_fix(
+            status == "A",
+            lat,
+            lon,
+            gps_timestamp,
+            gps_source
+        )
         if verified_fix is not None:
             lat, lon, gps_timestamp, gps_source = verified_fix
+        is_current_gps = current_fix is not None
+        server_received_at = _received_at_iso(received_at)
         _log_gps_diagnostic(
             "GPS packet device=%s command=%s status=%s coordinates_valid=%s timestamp_valid=%s",
             device_id,
@@ -125,6 +142,16 @@ def parse_ud(
             status,
             is_valid_coords,
             gps_timestamp is not None
+        )
+        gps_logger.info(
+            "GPS packet device=%s command=%s status=%s coordinates_valid=%s "
+            "verified=%s current=%s",
+            device_id,
+            cmd,
+            status,
+            is_valid_coords,
+            is_valid_gps,
+            is_current_gps
         )
 
         try:
@@ -154,18 +181,23 @@ def parse_ud(
             except Exception:
                 pass
 
-        gps_status = "GPS Locked" if is_valid_gps else "No Fix"
+        gps_status = (
+            "GPS Locked" if is_current_gps
+            else ("Location Stale" if is_valid_gps else "No Fix")
+        )
 
         record: Dict[str, Any] = {
             "device_id": device_id,
             "maker": maker,
             "command": cmd,
             "timestamp": gps_timestamp,
+            "received_at": server_received_at,
             "watch_date": date_str,
             "watch_time_utc": time_str,
             "gps_valid": is_valid_gps,
             "gps_fix": is_valid_gps,
             "gps_locked": is_valid_gps,
+            "gps_current": is_current_gps,
             "gps_status": gps_status,
             "gps_source": gps_source if is_valid_gps else None,
             "latitude": round(lat, 6) if is_valid_gps else None,
@@ -213,7 +245,8 @@ def parse_ud(
             satellites=satellites,
             gsm_signal=gsm_signal,
             timestamp=record.get("timestamp"),
-            gps_source=record.get("gps_source")
+            gps_source=record.get("gps_source"),
+            received_at=server_received_at
         )
         device_position_update_succeeded = True
         _log_gps_diagnostic(
@@ -256,28 +289,37 @@ def parse_packet(
     maker: str,
     dev_id: str,
     content: bytes,
-    gps_source: Optional[str] = None
+    gps_source: Optional[str] = None,
+    received_at: Optional[float] = None
 ) -> Tuple[Optional[str], Optional[bytes]]:
     """
     Decodes packet content, dispatches business logic, and returns (cmd_type, reply_frame_bytes).
     """
     msg = content.decode("latin-1", errors="ignore")
-    cmd = msg.split(",")[0]
+    cmd = msg.split(",")[0].strip()
+    cmd_key = cmd.upper()
+    received_at_value = _received_at_iso(received_at)
     reply_bytes = None
 
-    tcp_logger.info(f"[{maker}*{dev_id}] Recv command={cmd}")
+    tcp_logger.info("[%s*%s] Recv command=%s", maker, dev_id, cmd or "UNKNOWN")
 
     # Build acknowledgment reply if required by protocol
-    if cmd in REPLIES:
-        reply_body = REPLIES[cmd]
+    if cmd_key in REPLIES:
+        reply_body = REPLIES[cmd_key]
         reply_bytes = build_frame(maker, dev_id, reply_body)
 
     # 1. Location / Telemetry
-    if cmd in ("UD", "CRUD", "AL"):
-        parse_ud(content, dev_id, maker, gps_source=gps_source)
+    if cmd_key in ("UD", "CRUD", "AL"):
+        parse_ud(
+            content,
+            dev_id,
+            maker,
+            gps_source=gps_source,
+            received_at=received_at
+        )
 
     # 2. Keepalive (KA)
-    elif cmd == "KA":
+    elif cmd_key == "KA":
         parts = msg.split(",")
         bat = None
         steps = None
@@ -305,18 +347,20 @@ def parse_packet(
                     elif v > 100 and steps is None:
                         steps = v
 
-        device_service.update_heartbeat(dev_id, bat, steps, is_charging=is_charging)
+        device_service.update_heartbeat(
+            dev_id, bat, steps, is_charging=is_charging, received_at=received_at_value
+        )
         if bat is not None:
             alert_service.check_battery_alert(dev_id, bat)
 
     # 3. Heart Rate
-    elif cmd == "heart":
+    elif cmd_key == "HEART":
         parts = msg.split(",")
         bpm = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-        device_service.update_heart_rate(dev_id, bpm)
+        device_service.update_heart_rate(dev_id, bpm, received_at=received_at_value)
 
     # 4. Link & Status Heartbeat (LK)
-    elif cmd == "LK":
+    elif cmd_key == "LK":
         parts = msg.split(",")
         bat = None
         steps = None
@@ -340,8 +384,16 @@ def parse_packet(
             if len(parts) > 4 and parts[4].strip() in ("1", "true"):
                 is_charging = True
 
-        device_service.update_heartbeat(dev_id, bat, steps, is_charging=is_charging)
+        device_service.update_heartbeat(
+            dev_id, bat, steps, is_charging=is_charging, received_at=received_at_value
+        )
         if bat is not None:
             alert_service.check_battery_alert(dev_id, bat)
 
-    return cmd, reply_bytes
+    # These manufacturer control commands do not represent a GPS fix.
+    elif cmd_key in ("PING", "CR", "TIME", "LGZONE"):
+        device_service.update_heartbeat(
+            dev_id, None, None, received_at=received_at_value
+        )
+
+    return cmd_key, reply_bytes

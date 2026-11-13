@@ -246,7 +246,7 @@ class TestGPSAndFirebaseSync(unittest.TestCase):
             lon=None,
             battery=79,
             steps=1010,
-            gps_valid=False,
+            gps_valid=True,
             timestamp=now_ts
         )
         dev = device_service.get_device_by_id(self.dev_id)

@@ -64,6 +64,9 @@ CUSTODY_WATCH/
 Docker isolates all execution and bypasses Windows Application Control / AppLocker policies entirely:
 
 ```powershell
+# From the repository root, switch to the backend folder
+Set-Location backend
+
 # Build and start all services in background
 docker-compose up --build -d
 
@@ -82,15 +85,13 @@ docker-compose down
 ### Option B: Run Locally with Python
 
 > [!IMPORTANT]
-> If Windows Application Control blocks `uvicorn.exe` (`Program 'uvicorn.exe' failed to run: An Application Control policy has blocked this file`), run through `python` directly:
-
-From either the root folder or `backend/`:
+> If Windows Application Control blocks `uvicorn.exe` (`Program 'uvicorn.exe' failed to run: An Application Control policy has blocked this file`), run through `python` directly from `backend/`:
 
 ```powershell
-# Option 1: Using the pre-configured server launcher script
+# Using the pre-configured server launcher script
 python run_server.py
 
-# Option 2: Running module via Python
+# Or run the ASGI app directly
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -164,7 +165,7 @@ python simulate_watch.py
 
 The simulator will replay real `PING`, `KA`, `UD` (GPS: `17.446317, 78.368395`), and `heart` (96 BPM) frames.
 
-The moving GPS demo is isolated from the real custody watch. `run_live_system.bat` starts only the backend by default; pass `--simulate` to start the demo stream. The moving simulator uses device ID `SIMULATOR_863758061830955` by default, so its sample coordinates and 90% battery do not overwrite the real watch.
+The moving GPS demo is isolated from the real custody watch. Run `backend\run_live_system.bat` from the repository root to start only the backend by default; pass `--simulate` to start the demo stream. The moving simulator uses device ID `SIMULATOR_863758061830955` by default, so its sample coordinates and 90% battery do not overwrite the real watch.
 
 ---
 

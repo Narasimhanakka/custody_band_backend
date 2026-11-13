@@ -1,4 +1,5 @@
 import sys
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,7 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from app.receiver import packet_parser, tcp_server
+from app.receiver import packet_parser, packet_validator, tcp_server
 
 
 class FakeTCPConnection:
@@ -40,6 +41,9 @@ class FakeUDPSocket:
     def setsockopt(self, level, option, value):
         self.socket_options = (level, option, value)
 
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
     def bind(self, address):
         self.bound_address = address
 
@@ -55,14 +59,171 @@ class FakeUDPSocket:
     def sendto(self, data, address):
         self.sent.append((data, address))
 
+    def close(self):
+        self.closed = True
+
 
 class ReceiverDiagnosticsTests(unittest.TestCase):
+    def test_fragmented_and_coalesced_frames_are_extracted_exactly(self):
+        first = packet_parser.build_frame("MNYD", "TEST_DEVICE_1", "PING")
+        second = packet_parser.build_frame("MNYD", "TEST_DEVICE_2", "KA,1,0,50")
+
+        frames, remainder, rejected = packet_validator.extract_frames_with_errors(first[:11])
+        self.assertEqual(frames, [])
+        self.assertEqual(remainder, first[:11])
+        self.assertEqual(rejected, 0)
+
+        frames, remainder, rejected = packet_validator.extract_frames_with_errors(
+            remainder + first[11:] + second
+        )
+        self.assertEqual(
+            frames,
+            [
+                ("MNYD", "TEST_DEVICE_1", b"PING"),
+                ("MNYD", "TEST_DEVICE_2", b"KA,1,0,50"),
+            ]
+        )
+        self.assertEqual(remainder, b"")
+        self.assertEqual(rejected, 0)
+
+    def test_declared_length_mismatch_is_rejected_without_losing_next_frame(self):
+        malformed = b"[MNYD*TEST_DEVICE_BAD*0001*PING]"
+        valid = packet_parser.build_frame("MNYD", "TEST_DEVICE_OK", "PING")
+
+        frames, remainder, rejected = packet_validator.extract_frames_with_errors(
+            malformed + valid
+        )
+
+        self.assertEqual(frames, [("MNYD", "TEST_DEVICE_OK", b"PING")])
+        self.assertEqual(remainder, b"")
+        self.assertGreaterEqual(rejected, 1)
+
+    def test_tcp_connection_keeps_processing_after_malformed_frame(self):
+        malformed = b"[MNYD*TEST_DEVICE_BAD*0001*PING]"
+        valid = packet_parser.build_frame("MNYD", "TEST_DEVICE_OK", "PING")
+        connection = FakeTCPConnection([malformed + valid])
+
+        with (
+            patch.object(packet_parser.device_service, "update_heartbeat"),
+            self.assertLogs("custody_tcp", level="WARNING")
+        ):
+            tcp_server.handle_tcp_client(connection, ("127.0.0.1", 12340))
+
+        self.assertEqual(
+            connection.sent,
+            [packet_parser.build_frame("MNYD", "TEST_DEVICE_OK", "PING,1")]
+        )
+        self.assertFalse(tcp_server.active_connections)
+
+    def test_fragmented_and_multiple_tcp_packets_are_all_dispatched(self):
+        first = packet_parser.build_frame("MNYD", "TEST_DEVICE_MULTI", "PING")
+        second = packet_parser.build_frame("MNYD", "TEST_DEVICE_MULTI", "PING")
+        connection = FakeTCPConnection([first[:13], first[13:] + second])
+
+        with patch.object(packet_parser.device_service, "update_heartbeat"):
+            tcp_server.handle_tcp_client(connection, ("127.0.0.1", 12341))
+
+        self.assertEqual(
+            connection.sent,
+            [
+                packet_parser.build_frame("MNYD", "TEST_DEVICE_MULTI", "PING,1"),
+                packet_parser.build_frame("MNYD", "TEST_DEVICE_MULTI", "PING,1"),
+            ]
+        )
+
+    def test_cr_command_delivery_uses_registered_device_connection(self):
+        connection = FakeTCPConnection([])
+        tcp_server.register_client("TEST_DEVICE_COMMAND", connection)
+        try:
+            self.assertTrue(
+                tcp_server.send_command_to_device("TEST_DEVICE_COMMAND", "CR")
+            )
+            self.assertEqual(
+                connection.sent,
+                [packet_parser.build_frame("MNYD", "TEST_DEVICE_COMMAND", "CR")]
+            )
+        finally:
+            tcp_server.unregister_client("TEST_DEVICE_COMMAND", connection)
+
+    def test_reconnection_cannot_be_unregistered_by_old_connection(self):
+        old_connection = FakeTCPConnection([])
+        new_connection = FakeTCPConnection([])
+        tcp_server.register_client("TEST_DEVICE_RECONNECT", old_connection)
+        tcp_server.register_client("TEST_DEVICE_RECONNECT", new_connection)
+        try:
+            tcp_server.unregister_client("TEST_DEVICE_RECONNECT", old_connection)
+            self.assertIs(
+                tcp_server.active_connections["TEST_DEVICE_RECONNECT"],
+                new_connection
+            )
+            self.assertTrue(old_connection.closed)
+        finally:
+            tcp_server.unregister_client("TEST_DEVICE_RECONNECT", new_connection)
+
+    def test_simultaneous_devices_have_independent_connections(self):
+        first = FakeTCPConnection([])
+        second = FakeTCPConnection([])
+        tcp_server.register_client("TEST_DEVICE_A", first)
+        tcp_server.register_client("TEST_DEVICE_B", second)
+        try:
+            self.assertEqual(tcp_server.get_active_clients_count(), 2)
+            self.assertTrue(tcp_server.is_device_connected("TEST_DEVICE_A"))
+            self.assertTrue(tcp_server.is_device_connected("TEST_DEVICE_B"))
+        finally:
+            tcp_server.unregister_client("TEST_DEVICE_A", first)
+            tcp_server.unregister_client("TEST_DEVICE_B", second)
+
+    def test_receiver_startup_is_idempotent_and_shutdown_signals_listeners(self):
+        started = []
+
+        def fake_listener(ready_event, stop_event, _startup_errors):
+            started.append(threading.current_thread().name)
+            ready_event.set()
+            stop_event.wait(1)
+
+        with (
+            patch.object(tcp_server, "run_tcp_server", side_effect=fake_listener),
+            patch.object(tcp_server, "run_udp_server", side_effect=fake_listener)
+        ):
+            tcp_server.start_receiver_background()
+            tcp_server.start_receiver_background()
+            self.assertEqual(len(started), 2)
+            tcp_server.stop_receiver()
+
+        self.assertFalse(tcp_server._receiver_started)
+        self.assertFalse(tcp_server._listener_threads)
+
+    def test_tcp_bind_failure_is_reported_to_startup(self):
+        class FailingListener:
+            def setsockopt(self, *_args):
+                pass
+
+            def bind(self, _address):
+                raise OSError("address in use")
+
+            def close(self):
+                pass
+
+        ready = threading.Event()
+        errors = {}
+        with (
+            patch.object(tcp_server.socket, "socket", return_value=FailingListener()),
+            self.assertLogs("custody_tcp", level="CRITICAL")
+        ):
+            tcp_server.run_tcp_server(ready, threading.Event(), errors)
+
+        self.assertTrue(ready.is_set())
+        self.assertIn("tcp", errors)
+
     def test_tcp_frame_diagnostics_and_protocol_reply(self):
         frame = packet_parser.build_frame("MNYD", "TEST_DEVICE_1", "PING")
         connection = FakeTCPConnection([frame])
 
         with patch.object(tcp_server, "_DIAGNOSTICS_ENABLED", True):
-            with self.assertLogs("custody_tcp", level="INFO") as captured:
+            with (
+                patch.object(packet_parser.device_service, "update_heartbeat"),
+                self.assertLogs("custody_tcp", level="INFO") as captured
+            ):
                 tcp_server.handle_tcp_client(connection, ("127.0.0.1", 12345))
 
         logs = "\n".join(captured.output)
@@ -78,6 +239,11 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
 
     def test_tcp_gps_packet_is_dispatched_with_trusted_source_and_watch_time(self):
         packet_time = datetime.now(timezone.utc)
+        received_epoch = packet_time.timestamp() + 1
+        expected_received_at = datetime.fromtimestamp(
+            received_epoch,
+            timezone.utc
+        ).isoformat()
         payload = (
             f"UD,{packet_time:%y%m%d},{packet_time:%H%M%S},A,"
             "17.445000,N,78.370000,E,0.0,90.0,0.0,0,0,,,00000000"
@@ -91,7 +257,8 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
                 "process_location_record",
                 side_effect=lambda record: record
             ) as process_record,
-            patch.object(packet_parser.device_service, "update_position") as update_position
+            patch.object(packet_parser.device_service, "update_position") as update_position,
+            patch.object(tcp_server.time, "time", return_value=received_epoch)
         ):
             tcp_server.handle_tcp_client(connection, ("127.0.0.1", 12346))
 
@@ -102,7 +269,41 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
             record["timestamp"],
             packet_time.replace(microsecond=0).isoformat()
         )
+        self.assertEqual(record["received_at"], expected_received_at)
         self.assertEqual(update_position.call_args.kwargs["gps_source"], "watch_tcp")
+        self.assertEqual(
+            update_position.call_args.kwargs["received_at"],
+            expected_received_at
+        )
+
+    def test_ping_receives_manufacturer_ack_and_records_server_receipt_time(self):
+        received_epoch = datetime.now(timezone.utc).timestamp()
+        expected_received_at = datetime.fromtimestamp(
+            received_epoch,
+            timezone.utc
+        ).isoformat()
+        with (
+            patch.object(packet_parser.device_service, "update_heartbeat") as heartbeat,
+            self.assertLogs("custody_tcp", level="INFO")
+        ):
+            command, reply = packet_parser.parse_packet(
+                "MNYD",
+                "TEST_DEVICE_PING",
+                b"PING",
+                received_at=received_epoch
+            )
+
+        self.assertEqual(command, "PING")
+        self.assertEqual(
+            reply,
+            packet_parser.build_frame("MNYD", "TEST_DEVICE_PING", "PING,1")
+        )
+        heartbeat.assert_called_once_with(
+            "TEST_DEVICE_PING",
+            None,
+            None,
+            received_at=expected_received_at
+        )
 
     def test_udp_frame_diagnostics_and_protocol_reply(self):
         frame = packet_parser.build_frame("MNYD", "TEST_DEVICE_2", "PING")
@@ -111,6 +312,7 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
         with (
             patch.object(tcp_server, "_DIAGNOSTICS_ENABLED", True),
             patch.object(tcp_server.socket, "socket", return_value=udp_socket),
+            patch.object(packet_parser.device_service, "update_heartbeat"),
             self.assertLogs("custody_tcp", level="INFO") as captured
         ):
             tcp_server.run_udp_server()
@@ -128,7 +330,10 @@ class ReceiverDiagnosticsTests(unittest.TestCase):
         )
 
     def test_packet_command_log_does_not_include_payload(self):
-        with self.assertLogs("custody_tcp", level="INFO") as captured:
+        with (
+            patch.object(packet_parser.device_service, "update_heartbeat"),
+            self.assertLogs("custody_tcp", level="INFO") as captured
+        ):
             command, reply = packet_parser.parse_packet(
                 "MNYD", "TEST_DEVICE_3", b"PING,SENSITIVE_PAYLOAD"
             )

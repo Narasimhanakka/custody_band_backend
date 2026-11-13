@@ -59,13 +59,26 @@ class GPSService:
             lat,
             lon,
             record.get("timestamp"),
+            record.get("gps_source"),
+            max_age_seconds=None
+        )
+        current_fix = normalize_verified_gps_fix(
+            record.get("gps_valid"),
+            lat,
+            lon,
+            record.get("timestamp"),
             record.get("gps_source")
         )
         is_valid = verified_fix is not None
+        is_current = current_fix is not None
         record["gps_valid"] = is_valid
         record["gps_fix"] = is_valid
         record["gps_locked"] = is_valid
-        record["gps_status"] = "GPS Locked" if is_valid else "No Fix"
+        record["gps_current"] = is_current
+        record["gps_status"] = (
+            "GPS Locked" if is_current
+            else ("Location Stale" if is_valid else "No Fix")
+        )
 
         # 1. Resolve travel direction / arrow heading
         bearing = (
@@ -75,7 +88,7 @@ class GPSService:
         )
 
         if bearing is None and is_valid and lat is not None and lon is not None:
-            last_dev = firestore_service.get_device(record["device_id"])
+            last_dev = firestore_service.get_local_device(record["device_id"])
             if last_dev and last_dev.get("last_latitude") and last_dev.get("last_longitude"):
                 p_lat = last_dev["last_latitude"]
                 p_lon = last_dev["last_longitude"]
@@ -105,32 +118,39 @@ class GPSService:
             record["longitude"] = lon
             record["maps_url"] = self.build_maps_url(float(lat), float(lon))
             gps_logger.info(
-                f"[GPS FIX] Device {record['device_id']} at ({float(lat):.6f}, {float(lon):.6f}) - Heading: {bearing}° - {record['maps_url']}"
+                "GPS report accepted device=%s source=%s current=%s",
+                record["device_id"],
+                source,
+                is_current
             )
-            # Live Journey Route Tracking
-            try:
-                from .journey_service import journey_service
-                journey_service.record_journey_point(
-                    device_id=record["device_id"],
-                    latitude=float(lat),
-                    longitude=float(lon),
-                    timestamp=record["timestamp"],
-                    speed_kmh=float(record.get("speed_kmh") or record.get("speed") or 0.0)
-                )
-            except Exception as e:
-                gps_logger.warning(f"Journey point record note: {e}")
+            if is_current:
+                try:
+                    from .journey_service import journey_service
+                    journey_service.record_journey_point(
+                        device_id=record["device_id"],
+                        latitude=float(lat),
+                        longitude=float(lon),
+                        timestamp=record["timestamp"],
+                        speed_kmh=float(record.get("speed_kmh") or record.get("speed") or 0.0)
+                    )
+                except Exception as exc:
+                    gps_logger.warning(
+                        "Journey point write failed device=%s exception_type=%s",
+                        record["device_id"],
+                        type(exc).__name__
+                    )
         else:
             record["latitude"] = None
             record["longitude"] = None
             record["gps_source"] = None
             record["maps_url"] = None
-            batt_info = f"Battery: {record.get('battery')}%" if record.get('battery') is not None else "Battery: N/A"
             gps_logger.info(
-                f"[NO FIX] Device {record['device_id']} GPS invalid/indoor ({batt_info}, Steps: {record.get('steps')})"
+                "GPS report rejected device=%s reason=unverified_fix",
+                record["device_id"]
             )
 
         if is_valid:
-            firestore_service.save_telemetry(record, wait_for_firestore=True)
+            firestore_service.save_telemetry(record, wait_for_firestore=False)
         return record
 
 

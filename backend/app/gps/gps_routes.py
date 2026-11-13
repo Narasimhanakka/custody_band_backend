@@ -16,6 +16,7 @@ from ..services.device_service import device_service
 from ..services.alert_service import alert_service
 from ..receiver.tcp_server import send_command_to_device
 from ..config import settings
+from ..utils.logger import app_logger
 
 router = APIRouter(prefix="/gps", tags=["GPS & Locations"])
 
@@ -247,10 +248,11 @@ def get_live_locations():
     for d in devices:
         dev_id = str(d.get("device_id") or d.get("imei") or "")
         location = firestore_service.get_latest_valid_location(dev_id, d)
-        if location is None:
+        last_known_location = firestore_service.get_last_known_location(d)
+        if location is None and last_known_location is None:
             continue
 
-        gps_valid = bool(location.get("gps_valid", False))
+        gps_valid = bool(location and location.get("gps_valid", False))
         lat = location["latitude"] if gps_valid else None
         lon = location["longitude"] if gps_valid else None
         name = d.get("wearer_name") or d.get("name") or "Wearer"
@@ -258,7 +260,11 @@ def get_live_locations():
         speed_val = d.get("speed") or d.get("speed_kmh") or 0.0
         batt_val = d.get("battery")
         is_chg = bool(d.get("is_charging") or d.get("charging") or False)
-        gps_status = location.get("gps_status", d.get("gps_status", "No Fix"))
+        gps_status = (
+            location.get("gps_status", d.get("gps_status", "No Fix"))
+            if location else d.get("gps_status", "No Fix")
+        )
+        location_timestamp = location.get("timestamp") if location else None
 
         point = {
             "id": dev_id,
@@ -289,13 +295,19 @@ def get_live_locations():
             "gps_valid": gps_valid,
             "gps_fix": gps_valid,
             "gps_locked": gps_valid,
+            "coordinate_source": "live" if gps_valid else None,
+            "location_is_current": gps_valid,
+            "last_known_location": last_known_location,
             "last_seen": d.get("last_seen"),
-            "last_valid_gps_time": location.get("timestamp") or d.get("last_valid_gps_time"),
-            "timestamp": location.get("timestamp") or d.get("last_valid_gps_time"),
-            "gps_source": location.get("gps_source") if gps_valid else None,
+            "last_packet_received": d.get("last_packet_received") or d.get("last_seen"),
+            "tcp_connected": bool(d.get("tcp_connected", False)),
+            "connection_status": d.get("connection_status", "DISCONNECTED"),
+            "last_valid_gps_time": location_timestamp or d.get("last_valid_gps_time"),
+            "timestamp": location_timestamp or d.get("last_valid_gps_time"),
+            "gps_source": location.get("gps_source") if gps_valid and location else None,
             "maps_url": (
                 location.get("maps_url") or f"https://maps.google.com/?q={lat},{lon}"
-                if gps_valid else None
+                if gps_valid and location else None
             )
         }
         if batt_val is not None:
@@ -313,7 +325,7 @@ def get_live_locations():
 @router.get("/{device_id}/latest", response_model=Dict[str, Any])
 def get_latest_location(device_id: str):
     """
-    Get the most recent GPS location fix and telemetry for a specific band.
+    Get current GPS status and coordinates, falling back to a labeled last-known position.
     """
     dev = device_service.get_device_by_id(device_id)
     if not dev:
@@ -322,16 +334,31 @@ def get_latest_location(device_id: str):
             detail=f"Device '{device_id}' not found"
         )
 
-    history = firestore_service.get_telemetry_history(device_id, limit=1)
-    latest_telemetry = history[0] if history else {}
+    latest_telemetry = firestore_service.get_latest_valid_telemetry(device_id) or {}
     location = firestore_service.get_latest_valid_location(device_id, dev)
     bearing_val = dev.get("heading") or dev.get("bearing") or dev.get("course") or latest_telemetry.get("heading") or 0.0
     speed_val = latest_telemetry.get("speed_kmh") or dev.get("speed") or 0.0
     batt_val = dev.get("battery")
     is_chg = bool(dev.get("is_charging") or dev.get("charging") or False)
     gps_valid = bool(location and location.get("gps_valid", False))
-    lat = location["latitude"] if gps_valid else None
-    lon = location["longitude"] if gps_valid else None
+    last_known_location = firestore_service.get_last_known_location(dev)
+    lat = (
+        location["latitude"] if gps_valid
+        else last_known_location.get("latitude") if last_known_location else None
+    )
+    lon = (
+        location["longitude"] if gps_valid
+        else last_known_location.get("longitude") if last_known_location else None
+    )
+    has_last_known_coordinates = (
+        not gps_valid
+        and last_known_location is not None
+        and lat is not None
+        and lon is not None
+    )
+    coordinate_source = "live" if gps_valid else (
+        "last_known" if has_last_known_coordinates else None
+    )
     gps_status = (
         location.get("gps_status", dev.get("gps_status", "No Fix"))
         if location else dev.get("gps_status", "No Fix")
@@ -365,12 +392,22 @@ def get_latest_location(device_id: str):
         "gps_valid": gps_valid,
         "gps_fix": gps_valid,
         "gps_locked": gps_valid,
+        "coordinate_source": coordinate_source,
+        "location_is_current": gps_valid,
         "last_seen": dev.get("last_seen"),
-        "timestamp": location.get("timestamp") if location else dev.get("last_valid_gps_time"),
+        "last_packet_received": dev.get("last_packet_received") or dev.get("last_seen"),
+        "tcp_connected": bool(dev.get("tcp_connected", False)),
+        "connection_status": dev.get("connection_status", "DISCONNECTED"),
+        "timestamp": (
+            location.get("timestamp") if gps_valid
+            else last_known_location.get("timestamp") if has_last_known_coordinates
+            else dev.get("last_valid_gps_time")
+        ),
         "last_valid_gps_time": (
             location.get("timestamp") if location and location.get("timestamp")
             else dev.get("last_valid_gps_time")
         ),
+        "last_known_location": last_known_location,
         "gps_source": (
             location.get("gps_source") if gps_valid else None
         ),
@@ -378,7 +415,8 @@ def get_latest_location(device_id: str):
         "heart_rate": dev.get("heart_rate"),
         "maps_url": (
             location.get("maps_url") or f"https://maps.google.com/?q={lat},{lon}"
-            if gps_valid else None
+            if gps_valid else last_known_location.get("maps_url")
+            if has_last_known_coordinates else None
         )
     }
     if batt_val is not None:
@@ -418,18 +456,37 @@ def get_location_history(
             max_age_seconds=None
         )
         if verified_fix is None:
+            app_logger.debug(
+                "GPS history record rejected device=%s source=%s reason=unverified_or_invalid",
+                device_id,
+                record.get("gps_source")
+            )
             continue
         latitude, longitude, timestamp, gps_source = verified_fix
+        current_fix = normalize_verified_gps_fix(
+            record.get("gps_valid", record.get("gps_fix", False)),
+            latitude,
+            longitude,
+            timestamp,
+            gps_source
+        )
         record.update({
             "latitude": latitude,
             "longitude": longitude,
             "timestamp": timestamp,
             "gps_valid": True,
             "gps_fix": True,
-            "gps_status": "GPS Locked",
+            "gps_current": current_fix is not None,
+            "gps_status": "GPS Locked" if current_fix else "Location Stale",
             "gps_source": gps_source
         })
         verified_history.append(record)
+    app_logger.info(
+        "GPS history response device=%s returned=%d limit=%d",
+        device_id,
+        len(verified_history),
+        limit
+    )
     return verified_history
 
 

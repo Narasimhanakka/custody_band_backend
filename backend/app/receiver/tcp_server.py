@@ -1,22 +1,34 @@
-"""
-Multi-Threaded TCP & UDP Watch Receiver
-Binds to 0.0.0.0:9001 to accept traffic arriving from 103.44.0.5:9001.
-"""
+"""Concurrent TCP/UDP receiver for framed Huaten watch packets."""
 
+import os
 import socket
 import threading
 import time
-import os
 import traceback
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
+
 from ..config import settings
 from ..utils.logger import tcp_logger
-from .packet_validator import extract_frames
-from .packet_parser import parse_packet, build_frame
+from .packet_parser import build_frame, parse_packet
+from .packet_validator import extract_frames_with_errors
 
 active_connections: Dict[str, socket.socket] = {}
-conn_lock = threading.Lock()
+conn_lock = threading.RLock()
+_connection_write_locks: Dict[socket.socket, threading.Lock] = {}
+_connection_last_seen: Dict[str, float] = {}
+_client_connections: Set[socket.socket] = set()
+_client_threads: Set[threading.Thread] = set()
+_retired_connections: Set[socket.socket] = set()
+
+_lifecycle_lock = threading.Lock()
 _receiver_started = False
+_receiver_stop_event: Optional[threading.Event] = None
+_listener_threads: Dict[str, threading.Thread] = {}
+_tcp_server_sock: Optional[socket.socket] = None
+_udp_server_sock: Optional[socket.socket] = None
+
+CONNECTION_TIMEOUT_SECONDS = 600
+LISTENER_READY_TIMEOUT_SECONDS = 5
 _DIAGNOSTICS_ENABLED = os.getenv("GPS_RECEIVER_DIAGNOSTICS", "").strip().lower() in {
     "1", "true", "yes", "on"
 }
@@ -27,102 +39,220 @@ def _log_diagnostic(message: str, *args):
         tcp_logger.info(message, *args)
 
 
-def register_client(dev_id: str, conn: socket.socket):
+def _connection_write_lock(conn: socket.socket) -> threading.Lock:
     with conn_lock:
+        return _connection_write_locks.setdefault(conn, threading.Lock())
+
+
+def _close_socket(conn: socket.socket):
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except (AttributeError, OSError):
+        pass
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+
+def _unregister_connection(conn: socket.socket, final: bool = False):
+    with conn_lock:
+        _retired_connections.add(conn)
+        for device_id, registered_conn in list(active_connections.items()):
+            if registered_conn is conn:
+                active_connections.pop(device_id, None)
+                _connection_last_seen.pop(device_id, None)
+        write_lock = _connection_write_locks.get(conn)
+        _client_connections.discard(conn)
+
+    if write_lock is not None:
+        with write_lock:
+            _close_socket(conn)
+    else:
+        _close_socket(conn)
+
+    with conn_lock:
+        _connection_write_locks.pop(conn, None)
+        if final:
+            _retired_connections.discard(conn)
+
+
+def register_client(dev_id: str, conn: socket.socket) -> bool:
+    old_conn = None
+    was_registered = False
+    with conn_lock:
+        if conn in _retired_connections:
+            return False
+        old_conn = active_connections.get(dev_id)
+        was_registered = old_conn is conn
         active_connections[dev_id] = conn
+        _connection_last_seen[dev_id] = time.monotonic()
+        _connection_write_locks.setdefault(conn, threading.Lock())
+        _client_connections.add(conn)
+
+    if old_conn is not None and old_conn is not conn:
+        tcp_logger.info("Closing replaced TCP connection for device %s", dev_id)
+        _unregister_connection(old_conn)
+    if not was_registered:
+        tcp_logger.info("Device ID registered on TCP connection: %s", dev_id)
+    return True
 
 
-def unregister_client(dev_id: str):
+def unregister_client(dev_id: str, conn: Optional[socket.socket] = None):
+    """Unregister only the connection that still owns this device ID."""
+    stale_conn = None
     with conn_lock:
-        active_connections.pop(dev_id, None)
+        current_conn = active_connections.get(dev_id)
+        if current_conn is not None and (conn is None or current_conn is conn):
+            stale_conn = active_connections.pop(dev_id)
+            _connection_last_seen.pop(dev_id, None)
+        if stale_conn is not None and any(
+            registered_conn is stale_conn
+            for registered_conn in active_connections.values()
+        ):
+            stale_conn = None
+    if stale_conn is not None:
+        _unregister_connection(stale_conn)
+
+
+def is_device_connected(device_id: str) -> bool:
+    expired_conn = None
+    with conn_lock:
+        conn = active_connections.get(device_id)
+        last_seen = _connection_last_seen.get(device_id)
+        if conn is None:
+            return False
+        if last_seen is not None and time.monotonic() - last_seen <= CONNECTION_TIMEOUT_SECONDS:
+            return True
+        active_connections.pop(device_id, None)
+        _connection_last_seen.pop(device_id, None)
+        if not any(registered_conn is conn for registered_conn in active_connections.values()):
+            expired_conn = conn
+    if expired_conn is not None:
+        _unregister_connection(expired_conn)
+    return False
 
 
 def get_active_clients_count() -> int:
     with conn_lock:
-        return len(active_connections)
+        device_ids = list(active_connections)
+    return sum(1 for device_id in device_ids if is_device_connected(device_id))
+
+
+def _send_tcp_payload(conn: socket.socket, payload: bytes, device_id: Optional[str] = None) -> bool:
+    write_lock = _connection_write_lock(conn)
+    try:
+        with write_lock:
+            if device_id is not None:
+                with conn_lock:
+                    if active_connections.get(device_id) is not conn:
+                        return False
+            conn.sendall(payload)
+        return True
+    except OSError as exc:
+        tcp_logger.warning(
+            "TCP send failed device=%s exception_type=%s",
+            device_id or "unknown",
+            type(exc).__name__
+        )
+        _unregister_connection(conn)
+        return False
 
 
 def send_command_to_device(device_id: str, command: str, maker: str = "MNYD") -> bool:
-    """Sends a protocol command frame (e.g. CR for live GPS) to a connected watch."""
+    """Send a manufacturer-framed command to the currently registered watch."""
     with conn_lock:
         conn = active_connections.get(device_id)
-
-    if not conn:
-        tcp_logger.warning(f"Cannot send command '{command}': Device {device_id} is not currently connected")
+    if conn is None or not is_device_connected(device_id):
+        tcp_logger.warning(
+            "Cannot send command=%s device=%s reason=not_connected",
+            command,
+            device_id
+        )
         return False
 
     frame = build_frame(maker, device_id, command)
-    try:
-        conn.sendall(frame)
-        tcp_logger.info(f"[{maker}*{device_id}] Sent Command <- {command}")
-        return True
-    except Exception as e:
-        tcp_logger.error(f"Failed to send command to {device_id}: {e}")
+    if not _send_tcp_payload(conn, frame, device_id):
         return False
+    tcp_logger.info("[%s*%s] Sent Command <- %s", maker, device_id, command)
+    return True
+
+
+def _dispatch_tcp_frame(conn: socket.socket, maker: str, device_id: str, content: bytes):
+    if not register_client(device_id, conn):
+        return
+    received_at = time.time()
+    try:
+        cmd_type, reply_bytes = parse_packet(
+            maker,
+            device_id,
+            content,
+            gps_source="watch_tcp",
+            received_at=received_at
+        )
+    except Exception as exc:
+        tcp_logger.error(
+            "TCP packet processing failed device=%s exception_type=%s stack=%s",
+            device_id,
+            type(exc).__name__,
+            "".join(traceback.format_tb(exc.__traceback__))
+        )
+        return
+
+    _log_diagnostic(
+        "TCP parsed frame device=%s command=%s",
+        device_id,
+        cmd_type or "UNKNOWN"
+    )
+    if reply_bytes and _send_tcp_payload(conn, reply_bytes, device_id):
+        tcp_logger.info("[%s*%s] Manufacturer acknowledgement sent", maker, device_id)
+
+    if cmd_type == "PING" and settings.AUTO_POLL_GPS_ON_PING:
+        def poll_gps_delayed(maker_name=maker, device=device_id):
+            time.sleep(0.5)
+            send_command_to_device(device, "CR", maker_name)
+
+        threading.Thread(target=poll_gps_delayed, daemon=True).start()
 
 
 def handle_tcp_client(conn: socket.socket, addr):
-    client_str = f"{addr[0]}:{addr[1]}"
-    tcp_logger.info(f"TCP connection established from {client_str}")
-    assigned_device_id = None
+    client_str = "{}:{}".format(addr[0], addr[1])
+    with conn_lock:
+        _client_threads.add(threading.current_thread())
+    tcp_logger.info("TCP connection established from %s", client_str)
     buffer = b""
 
     try:
-        conn.settimeout(300)  # 5 minutes idle timeout
+        conn.settimeout(300)
         while True:
             data = conn.recv(4096)
             if not data:
                 break
 
             _log_diagnostic("TCP received %d bytes from %s", len(data), client_str)
-            buffer += data
-            frames, buffer = extract_frames(buffer)
-            _log_diagnostic("TCP extracted %d complete frame(s) from %s", len(frames), client_str)
-
-            for maker, dev_id, content in frames:
-                assigned_device_id = dev_id
-                register_client(dev_id, conn)
-
-                try:
-                    cmd_type, reply_bytes = parse_packet(
-                        maker, dev_id, content, gps_source="watch_tcp"
-                    )
-                except Exception as exc:
-                    tcp_logger.error(
-                        "TCP packet parsing failed for device %s exception_type=%s stack=%s",
-                        dev_id,
-                        type(exc).__name__,
-                        "".join(traceback.format_tb(exc.__traceback__))
-                    )
-                    raise
-                _log_diagnostic(
-                    "TCP parsed frame device=%s command=%s",
-                    dev_id,
-                    cmd_type or "UNKNOWN"
+            frames, buffer, rejected = extract_frames_with_errors(buffer + data)
+            if rejected:
+                tcp_logger.warning(
+                    "TCP discarded malformed or unframed data from %s count=%d",
+                    client_str,
+                    rejected
                 )
-
-                # Send mandatory protocol reply
-                if reply_bytes:
-                    try:
-                        conn.sendall(reply_bytes)
-                        tcp_logger.info(f"[{maker}*{dev_id}] Sent Reply <- {reply_bytes.decode('latin-1', errors='ignore')}")
-                    except Exception as e:
-                        tcp_logger.error(f"Send reply error: {e}")
-
-                # Auto-poll GPS on connection PING if enabled
-                if cmd_type == "PING" and settings.AUTO_POLL_GPS_ON_PING:
-                    def poll_gps_delayed(m=maker, d=dev_id, c=conn):
-                        time.sleep(0.5)
-                        try:
-                            cr_frame = build_frame(m, d, "CR")
-                            c.sendall(cr_frame)
-                            tcp_logger.info(f"[{m}*{d}] Sent <- CR (Auto-polling live GPS)")
-                        except Exception:
-                            pass
-                    threading.Thread(target=poll_gps_delayed, daemon=True).start()
+            _log_diagnostic(
+                "TCP extracted %d complete frame(s) from %s",
+                len(frames),
+                client_str
+            )
+            for maker, device_id, content in frames:
+                _dispatch_tcp_frame(conn, maker, device_id, content)
 
     except socket.timeout:
-        tcp_logger.info(f"TCP connection {client_str} timed out (device sleeping)")
+        tcp_logger.info("TCP connection %s timed out", client_str)
+    except OSError as exc:
+        tcp_logger.info(
+            "TCP connection closed client=%s exception_type=%s",
+            client_str,
+            type(exc).__name__
+        )
     except Exception as exc:
         tcp_logger.error(
             "TCP connection %s error exception_type=%s stack=%s",
@@ -131,111 +261,251 @@ def handle_tcp_client(conn: socket.socket, addr):
             "".join(traceback.format_tb(exc.__traceback__))
         )
     finally:
-        if assigned_device_id:
-            unregister_client(assigned_device_id)
-        conn.close()
-        tcp_logger.info(f"TCP client disconnected: {client_str}")
+        _unregister_connection(conn, final=True)
+        with conn_lock:
+            _client_threads.discard(threading.current_thread())
+        tcp_logger.info("TCP client disconnected: %s", client_str)
 
 
-_tcp_server_sock: Optional[socket.socket] = None
-_udp_server_sock: Optional[socket.socket] = None
+def _set_listener_exclusive(listener: socket.socket):
+    if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 
-def run_tcp_server():
+def _publish_listener_ready(
+    protocol: str,
+    ready_event: Optional[threading.Event],
+    startup_errors: Optional[Dict[str, str]],
+    error: Optional[BaseException] = None
+):
+    if error is not None and startup_errors is not None:
+        startup_errors[protocol] = "{}: {}".format(type(error).__name__, error)
+    if ready_event is not None:
+        ready_event.set()
+
+
+def run_tcp_server(
+    ready_event: Optional[threading.Event] = None,
+    stop_event: Optional[threading.Event] = None,
+    startup_errors: Optional[Dict[str, str]] = None
+):
     global _tcp_server_sock
+    stop_event = stop_event or threading.Event()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    _tcp_server_sock = server
     try:
+        _set_listener_exclusive(server)
         server.bind((settings.TCP_HOST, settings.TCP_PORT))
-        server.listen(10)
-        tcp_logger.info(f"TCP Watch Receiver listening on {settings.TCP_HOST}:{settings.TCP_PORT} (Public IP: {settings.PUBLIC_SERVER_IP})")
-        while True:
+        server.listen(128)
+        server.settimeout(1.0)
+        _tcp_server_sock = server
+        tcp_logger.info(
+            "TCP Watch Receiver listening on %s:%s (Public IP: %s)",
+            settings.TCP_HOST,
+            settings.TCP_PORT,
+            settings.PUBLIC_SERVER_IP
+        )
+        _publish_listener_ready("tcp", ready_event, startup_errors)
+        while not stop_event.is_set():
             try:
                 conn, addr = server.accept()
-                threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True).start()
-            except OSError:
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if stop_event.is_set():
+                    break
+                tcp_logger.warning(
+                    "TCP listener stopped after socket error exception_type=%s",
+                    type(exc).__name__
+                )
                 break
-    except Exception as e:
-        tcp_logger.critical(f"TCP Server encountered fatal error: {e}")
-
-
-def run_udp_server():
-    global _udp_server_sock
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    _udp_server_sock = udp_sock
-    try:
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_sock.bind((settings.TCP_HOST, settings.TCP_PORT))
-        tcp_logger.info(f"UDP Watch Receiver listening on {settings.TCP_HOST}:{settings.TCP_PORT}")
-        while True:
-            try:
-                data, addr = udp_sock.recvfrom(4096)
-                _log_diagnostic("UDP received %d bytes", len(data))
-                frames, _ = extract_frames(data)
-                _log_diagnostic("UDP extracted %d complete frame(s)", len(frames))
-                for maker, dev_id, content in frames:
-                    try:
-                        cmd_type, reply_bytes = parse_packet(
-                            maker, dev_id, content, gps_source="watch_udp"
-                        )
-                    except Exception as exc:
-                        tcp_logger.error(
-                            "UDP packet parsing failed for device %s exception_type=%s stack=%s",
-                            dev_id,
-                            type(exc).__name__,
-                            "".join(traceback.format_tb(exc.__traceback__))
-                        )
-                        raise
-                    _log_diagnostic(
-                        "UDP parsed frame device=%s command=%s",
-                        dev_id,
-                        cmd_type or "UNKNOWN"
-                    )
-                    if reply_bytes:
-                        udp_sock.sendto(reply_bytes, addr)
-            except OSError:
-                break
-    except OSError as e:
-        if getattr(e, "winerror", None) == 10048 or "10048" in str(e):
-            tcp_logger.info(f"UDP port {settings.TCP_PORT} is shared or reserved. Running on primary TCP listener.")
-        else:
-            tcp_logger.info(f"UDP Server notice: {e}")
-    except Exception as exc:
-        tcp_logger.error(
-            "UDP server error exception_type=%s stack=%s",
-            type(exc).__name__,
-            "".join(traceback.format_tb(exc.__traceback__))
+            with conn_lock:
+                _client_connections.add(conn)
+            threading.Thread(
+                target=handle_tcp_client,
+                args=(conn, addr),
+                daemon=True,
+                name="TCPClient-{}:{}".format(addr[0], addr[1])
+            ).start()
+    except OSError as exc:
+        _publish_listener_ready("tcp", ready_event, startup_errors, exc)
+        tcp_logger.critical(
+            "TCP receiver failed to bind/listen on %s:%s exception_type=%s",
+            settings.TCP_HOST,
+            settings.TCP_PORT,
+            type(exc).__name__
         )
+    finally:
+        if _tcp_server_sock is server:
+            _tcp_server_sock = None
+        try:
+            server.close()
+        except OSError:
+            pass
+
+
+def run_udp_server(
+    ready_event: Optional[threading.Event] = None,
+    stop_event: Optional[threading.Event] = None,
+    startup_errors: Optional[Dict[str, str]] = None
+):
+    global _udp_server_sock
+    stop_event = stop_event or threading.Event()
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        _set_listener_exclusive(udp_sock)
+        udp_sock.bind((settings.TCP_HOST, settings.TCP_PORT))
+        udp_sock.settimeout(1.0)
+        _udp_server_sock = udp_sock
+        tcp_logger.info(
+            "UDP Watch Receiver listening on %s:%s",
+            settings.TCP_HOST,
+            settings.TCP_PORT
+        )
+        _publish_listener_ready("udp", ready_event, startup_errors)
+        while not stop_event.is_set():
+            try:
+                data, address = udp_sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if stop_event.is_set():
+                    break
+                tcp_logger.warning(
+                    "UDP receiver stopped after socket error exception_type=%s",
+                    type(exc).__name__
+                )
+                break
+
+            _log_diagnostic("UDP received %d bytes", len(data))
+            frames, _, rejected = extract_frames_with_errors(data)
+            if rejected:
+                tcp_logger.warning("UDP discarded malformed data count=%d", rejected)
+            _log_diagnostic("UDP extracted %d complete frame(s)", len(frames))
+            for maker, device_id, content in frames:
+                try:
+                    cmd_type, reply_bytes = parse_packet(
+                        maker,
+                        device_id,
+                        content,
+                        gps_source="watch_udp",
+                        received_at=time.time()
+                    )
+                except Exception as exc:
+                    tcp_logger.error(
+                        "UDP packet processing failed device=%s exception_type=%s stack=%s",
+                        device_id,
+                        type(exc).__name__,
+                        "".join(traceback.format_tb(exc.__traceback__))
+                    )
+                    continue
+                _log_diagnostic(
+                    "UDP parsed frame device=%s command=%s",
+                    device_id,
+                    cmd_type or "UNKNOWN"
+                )
+                if reply_bytes:
+                    try:
+                        udp_sock.sendto(reply_bytes, address)
+                    except OSError as exc:
+                        tcp_logger.warning(
+                            "UDP reply failed device=%s exception_type=%s",
+                            device_id,
+                            type(exc).__name__
+                        )
+    except OSError as exc:
+        _publish_listener_ready("udp", ready_event, startup_errors, exc)
+        tcp_logger.critical(
+            "UDP receiver failed to bind/listen on %s:%s exception_type=%s",
+            settings.TCP_HOST,
+            settings.TCP_PORT,
+            type(exc).__name__
+        )
+    finally:
+        if _udp_server_sock is udp_sock:
+            _udp_server_sock = None
+        try:
+            udp_sock.close()
+        except OSError:
+            pass
 
 
 def stop_receiver():
-    """Closes server sockets cleanly on application reload or shutdown."""
-    global _tcp_server_sock, _udp_server_sock, _receiver_started
-    _receiver_started = False
-    if _tcp_server_sock:
-        try:
-            _tcp_server_sock.close()
-        except Exception:
-            pass
-        _tcp_server_sock = None
-    if _udp_server_sock:
-        try:
-            _udp_server_sock.close()
-        except Exception:
-            pass
-        _udp_server_sock = None
+    """Stop listeners and active client sockets before the application exits."""
+    global _receiver_started, _receiver_stop_event
+    with _lifecycle_lock:
+        stop_event = _receiver_stop_event
+        threads = list(_listener_threads.values())
+        _receiver_started = False
+        if stop_event is not None:
+            stop_event.set()
+        tcp_socket = _tcp_server_sock
+        udp_socket = _udp_server_sock
+        with conn_lock:
+            client_sockets = list(_client_connections)
+            client_threads = list(_client_threads)
+
+    for listener in (tcp_socket, udp_socket):
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+    for conn in client_sockets:
+        _unregister_connection(conn)
+
+    current_thread = threading.current_thread()
+    for thread in threads + client_threads:
+        if thread is not current_thread:
+            thread.join(timeout=3)
+
+    with _lifecycle_lock:
+        _listener_threads.clear()
+        _receiver_stop_event = None
 
 
 def start_receiver_background():
-    """Starts TCP and UDP receiver threads in background."""
-    global _receiver_started
-    if _receiver_started:
-        return
-    _receiver_started = True
+    """Start exactly one TCP and one UDP listener and fail startup on bind errors."""
+    global _receiver_started, _receiver_stop_event
+    with _lifecycle_lock:
+        if _receiver_started:
+            return
+        _receiver_started = True
+        stop_event = threading.Event()
+        tcp_ready = threading.Event()
+        udp_ready = threading.Event()
+        startup_errors: Dict[str, str] = {}
+        _receiver_stop_event = stop_event
+        tcp_thread = threading.Thread(
+            target=run_tcp_server,
+            args=(tcp_ready, stop_event, startup_errors),
+            daemon=True,
+            name="TCPReceiverThread"
+        )
+        udp_thread = threading.Thread(
+            target=run_udp_server,
+            args=(udp_ready, stop_event, startup_errors),
+            daemon=True,
+            name="UDPReceiverThread"
+        )
+        _listener_threads.clear()
+        _listener_threads["tcp"] = tcp_thread
+        _listener_threads["udp"] = udp_thread
+        tcp_thread.start()
+        udp_thread.start()
 
-    t_tcp = threading.Thread(target=run_tcp_server, daemon=True, name="TCPReceiverThread")
-    t_tcp.start()
-
-    t_udp = threading.Thread(target=run_udp_server, daemon=True, name="UDPReceiverThread")
-    t_udp.start()
+    if not tcp_ready.wait(LISTENER_READY_TIMEOUT_SECONDS):
+        stop_receiver()
+        raise RuntimeError("TCP receiver did not complete startup")
+    if not udp_ready.wait(LISTENER_READY_TIMEOUT_SECONDS):
+        stop_receiver()
+        raise RuntimeError("UDP receiver did not complete startup")
+    if startup_errors:
+        errors = "; ".join(
+            "{}: {}".format(protocol, error)
+            for protocol, error in sorted(startup_errors.items())
+        )
+        stop_receiver()
+        raise OSError("GPS receiver startup failed: {}".format(errors))
+    tcp_logger.info("TCP and UDP watch receivers started")

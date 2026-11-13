@@ -34,6 +34,7 @@ from .custody.custody_routes import router as custody_router
 from .journeys.journey_routes import router as journey_router
 
 from .services.device_service import device_service
+from .services.firestore_service import firestore_service
 
 
 @asynccontextmanager
@@ -74,11 +75,14 @@ async def lifespan(app: FastAPI):
 
     # 4. Start background TCP/UDP receiver for Huaten C05 Watch
     start_receiver_background()
+    firestore_service.start_firestore_sync_worker()
 
-    yield
-
-    app_logger.info(f"Shutting down {settings.PROJECT_NAME}")
-    stop_receiver()
+    try:
+        yield
+    finally:
+        app_logger.info(f"Shutting down {settings.PROJECT_NAME}")
+        stop_receiver()
+        firestore_service.stop_firestore_sync_worker()
 
 
 # FastAPI App
